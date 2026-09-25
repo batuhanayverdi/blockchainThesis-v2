@@ -1,0 +1,49 @@
+destination,source,size_kb,modified
+01_data_collection/01_0-hive-scraping-everything.py,fact_checked_hive_pipeline/0-hive-scraping-everything.py,10.1,2026-05-30 16:03
+01_data_collection/02_0-classify-full-dataset.py,fact_checked_hive_pipeline/0-classify-full-dataset.py,13.6,2026-08-06 10:46
+02_filtering_and_cleaning/01_1-hive_language_filter_90.py,fact_checked_hive_pipeline/1-hive_language_filter_90.py,13.6,2026-06-24 15:47
+02_filtering_and_cleaning/02_2-hive_cleaning.py,fact_checked_hive_pipeline/2-hive_cleaning.py,13.8,2026-06-25 10:47
+02_filtering_and_cleaning/03_2-spot_check_overcleaned.py,fact_checked_hive_pipeline/2-spot_check_overcleaned.py,5.8,2026-06-25 10:33
+03_claim_gate_and_sampling/01_3-hive_claimbuster_gate.py,fact_checked_hive_pipeline/3-hive_claimbuster_gate.py,9.7,2026-06-25 11:13
+03_claim_gate_and_sampling/02_hive_sampler.py,fact_checked_hive_pipeline/hive sample preparation (politic-non-politic)/hive_sampler.py,8.4,2026-06-26 14:59
+03_claim_gate_and_sampling/03_visualize_sample.py,fact_checked_hive_pipeline/hive sample preparation (politic-non-politic)/visualize_sample.py,5.9,2026-06-25 15:28
+04_fact_checking/model1_title_only/01_hive_model1_select_query.py,fact_checked_hive_pipeline/4.1. model (just title)/hive_model1_select_query.py,8.6,2026-06-25 16:14
+04_fact_checking/model1_title_only/02_hive_model1_search.py,fact_checked_hive_pipeline/4.1. model (just title)/hive_model1_search.py,9.7,2026-06-25 23:01
+04_fact_checking/model1_title_only/03_hive_model1_fact_check.py,fact_checked_hive_pipeline/4.1. model (just title)/hive_model1_fact_check.py,12.0,2026-06-25 16:13
+04_fact_checking/model3_full_text/01_hive_model3_select_query.py,fact_checked_hive_pipeline/4.3. model full transkript (6 verdict)/hive_model3_select_query.py,10.5,2026-06-25 16:14
+04_fact_checking/model3_full_text/02_hive_model3_search.py,fact_checked_hive_pipeline/4.3. model full transkript (6 verdict)/hive_model3_search.py,9.7,2026-07-17 06:07
+04_fact_checking/model3_full_text/03_hive_model3_fact_check.py,fact_checked_hive_pipeline/4.3. model full transkript (6 verdict)/hive_model3_fact_check.py,13.5,2026-06-25 16:13
+04_fact_checking/model3_full_text/04_hive_model3_fact_check_batch_submit.py,fact_checked_hive_pipeline/4.3. model full transkript (6 verdict)/hive_model3_fact_check_batch_submit.py,9.3,2026-06-26 02:17
+04_fact_checking/model3_full_text/05_hive_model3_fact_check_batch_collect.py,fact_checked_hive_pipeline/4.3. model full transkript (6 verdict)/hive_model3_fact_check_batch_collect.py,10.8,2026-06-26 02:17
+04_fact_checking/model4_cascade/01_hive_build_model4.py,"fact_checked_hive_pipeline/4.4. model cascade (model3,1)/hive_build_model4.py",3.6,2026-06-26 08:10
+04_fact_checking/model4_cascade/02_build_hive_review_excel.py,"fact_checked_hive_pipeline/4.4. model cascade (model3,1)/build_hive_review_excel.py",12.9,2026-06-26 08:31
+05_features/01_5-hive_emotion_scores.py,fact_checked_hive_pipeline/5-hive_emotion_scores.py,10.0,2026-06-26 09:16
+05_features/02_6-hive_vad_scores.py,fact_checked_hive_pipeline/17. NRC_VAD/6-hive_vad_scores.py,13.2,2026-07-24 10:40
+05_features/03_7-vad_spot_check.py,fact_checked_hive_pipeline/17. NRC_VAD/7-vad_spot_check.py,10.0,2026-07-24 10:57
+05_features/04_hive_extract_engagement_v2.py,fact_checked_hive_pipeline/7. hive new dataset/hive_extract_engagement_v2.py,9.3,2026-07-11 08:53
+05_features/05_9a-hive_sentence_emotion_scoring.py,fact_checked_hive_pipeline/9. Sentence Emotion Scoring/9a-hive_sentence_emotion_scoring.py,14.6,2026-07-26 08:40
+05_features/06_9b-hive_emotion_dynamics.py,fact_checked_hive_pipeline/9. Sentence Emotion Scoring/9b-hive_emotion_dynamics.py,17.3,2026-07-26 08:40
+05_features/07_hive_political_identity_v2.py,fact_checked_hive_pipeline/10. Political Identity Language/hive_political_identity_v2.py,9.7,2026-07-03 08:22
+05_features/08_hive_doc_outrage_scoring_v3.py,fact_checked_hive_pipeline/11. Moral Outrage/hive_doc_outrage_scoring_v3.py,15.1,2026-07-03 10:02
+05_features/09_hive_post_features_v2.py,fact_checked_hive_pipeline/12. Post Features/hive_post_features_v2.py,8.9,2026-07-03 11:32
+05_features/10_hive_author_standing.py,fact_checked_hive_pipeline/12. Post Features/hive_author_standing.py,11.2,2026-07-11 08:56
+06_analysis/01_build_regression_dataset_final.py,fact_checked_hive_pipeline/17. NRC_VAD/build_regression_dataset_final.py,56.9,2026-07-24 12:35
+06_analysis/02_hive_regression (4).qmd,fact_checked_hive_pipeline/17. NRC_VAD/hive_regression (4).qmd,109.5,2026-09-06 21:52
+06_analysis/03_0-follower_probe_v4.py,fact_checked_hive_pipeline/16. Eckert's Feedback/0-follower_probe_v4.py,10.8,2026-07-23 20:23
+07_human_validation/01_build_validation.py,fact_checked_hive_pipeline/8. human validation/build_validation.py,30.0,2026-07-01 14:25
+07_human_validation/02_evaluate_validation-v2.py,fact_checked_hive_pipeline/8. human validation/evaluate_validation-v2.py,9.8,2026-09-07 16:40
+08_method_validation_youtube/01_0_preprocess_transcripts_parallel.py,fact_checked_pipeline/0_preprocess_transcripts_parallel.py,7.0,2026-06-06 02:06
+08_method_validation_youtube/02_build_pilot_transcripts.py,fact_checked_pipeline/build_pilot_transcripts.py,3.5,2026-06-06 01:37
+08_method_validation_youtube/03_1_claimbuster.py,fact_checked_pipeline/1_claimbuster.py,9.2,2026-06-06 08:20
+08_method_validation_youtube/04_model1_select_query.py,fact_checked_pipeline/1. model - just title/model1_select_query.py,7.8,2026-06-24 18:08
+08_method_validation_youtube/05_model1_search.py,fact_checked_pipeline/1. model - just title/model1_search.py,5.2,2026-06-24 18:05
+08_method_validation_youtube/06_model1_fact_check.py,fact_checked_pipeline/1. model - just title/model1_fact_check.py,10.0,2026-06-24 18:05
+08_method_validation_youtube/07_model3_select_query.py,fact_checked_pipeline/3. model - full transkript (6 verdict)/model3_select_query.py,8.2,2026-06-24 18:10
+08_method_validation_youtube/08_model3_search.py,fact_checked_pipeline/3. model - full transkript (6 verdict)/model3_search.py,5.2,2026-06-24 18:05
+08_method_validation_youtube/09_model3_fact_check.py,fact_checked_pipeline/3. model - full transkript (6 verdict)/model3_fact_check.py,12.8,2026-06-24 18:05
+08_method_validation_youtube/10_build_model4.py,fact_checked_pipeline/4. model - cascade 3+1/build_model4.py,3.6,2026-06-25 10:02
+08_method_validation_youtube/11_build_review_excel.py,fact_checked_pipeline/build_review_excel.py,7.7,2026-06-21 20:12
+08_method_validation_youtube/12_evaluate_f1.py,fact_checked_pipeline/evaluate_f1.py,6.8,2026-06-21 20:08
+08_method_validation_youtube/13_compare_model.py,fact_checked_pipeline/compare_model.py,8.0,2026-06-25 10:02
+09_figures/01_figure1_pipeline.py,fact_checked_hive_pipeline/figure1_pipeline.py,4.2,2026-09-08 19:15
+09_figures/02_figure4-1_r2_ladder.py,figure4-1_r2_ladder.py,1.0,2026-09-09 11:15

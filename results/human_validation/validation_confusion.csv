@@ -1,0 +1,6 @@
+﻿model_label,pants_on_fire,false,mostly_false,mostly_true,true,unverified
+pants_on_fire,10,6,2,0,1,1
+false,1,3,7,3,5,1
+mostly_false,0,1,2,10,3,4
+mostly_true,0,0,1,5,10,4
+true,1,0,1,3,11,4

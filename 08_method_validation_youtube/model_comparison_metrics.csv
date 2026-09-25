@@ -1,0 +1,9 @@
+model,view,n_scored,n_excluded,accuracy,precision_misinfo,recall_misinfo,f1_misinfo,macro_f1
+Model 1 (title),FULL,634,101,0.76,0.981,0.412,0.58,0.706
+Model 1 (title),MATCHED,329,101,0.875,0.981,0.729,0.837,0.868
+"Model 2 (full, 3-class)",FULL,691,44,0.669,0.69,0.372,0.483,0.62
+"Model 2 (full, 3-class)",MATCHED,386,44,0.694,0.69,0.605,0.645,0.688
+"Model 3 (full, 6-class)",FULL,715,20,0.695,0.761,0.402,0.526,0.651
+"Model 3 (full, 6-class)",MATCHED,410,20,0.739,0.761,0.637,0.693,0.733
+Model 4 (cascade 3+1),FULL,731,4,0.699,0.771,0.413,0.538,0.657
+Model 4 (cascade 3+1),MATCHED,426,4,0.744,0.771,0.643,0.701,0.739

@@ -1,0 +1,3542 @@
+---
+title: "Study 1 (Hive): Clean Regression Analysis"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    df-print: paged
+execute:
+  warning: false
+  message: false
+editor: source
+---
+
+This file produces a clean Study 1 analysis aligned with the latest supervision decisions. The main independent variable is the categorical number of asserted misleading body claims. The six DistilRoBERTa emotion dimensions are analysed separately. Title misinformation and payout are reported as robustness analyses. BH-FDR and joint Wald tests are intentionally omitted from this version.
+
+# 0. Setup
+
+```{r}
+#| label: setup
+
+library(tidyverse)
+library(arrow)
+library(fixest)
+library(modelsummary)
+library(gt)
+library(scales)
+library(ggcorrplot)
+library(broom)
+library(forcats)
+
+rm(list = ls())
+set.seed(20260101)
+options(encoding = "UTF-8")
+
+base_dir <- "C:\\Users\\batuh\\PycharmProjects\\Thesis\\fact_checked_hive_pipeline"
+
+data_path <- file.path(
+  base_dir,
+  "6. regression",
+  "hive_regression_dataset_main.parquet"
+)
+
+output_dir <- file.path(base_dir, "6. regression", "clean_regression_output")
+pdf_dir <- file.path(output_dir, "pdf_tables")
+html_dir <- file.path(output_dir, "html_tables")
+fig_png_dir <- file.path(output_dir, "figures_png")
+fig_pdf_dir <- file.path(output_dir, "figures_pdf")
+dir.create(pdf_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(html_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(fig_png_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(fig_pdf_dir, recursive = TRUE, showWarnings = FALSE)
+
+if (!file.exists(data_path)) {
+  stop("Regression dataset not found: ", data_path)
+}
+
+# HC1 heteroskedasticity-robust standard errors.
+se_main <- "hetero"
+
+emotion_vars <- c(
+  "anger", "disgust", "fear", "joy", "sadness", "surprise"
+)
+
+# NRC-VAD lexicon dimensions (Mohammad, 2018): a model-free alternative
+# operationalization of emotional language, used for the H2 robustness check.
+vad_vars <- c("valence", "arousal", "dominance")
+
+vad_labels <- c(
+  valence = "Valence",
+  arousal = "Arousal",
+  dominance = "Dominance"
+)
+
+emotion_labels <- c(
+  anger = "Anger",
+  disgust = "Disgust",
+  fear = "Fear",
+  joy = "Joy",
+  sadness = "Sadness",
+  surprise = "Surprise"
+)
+
+standing_vars <- c(
+  "log_pre_rewards",
+  "log_pre_curation",
+  "log_pre_posts",
+  "log_acct_age"
+)
+
+standing_labels <- c(
+  log_pre_rewards = "Pre-window cumulative author rewards",
+  log_pre_curation = "Pre-window cumulative curation rewards",
+  log_pre_posts = "Pre-window post count",
+  log_acct_age = "Pre-window account age"
+)
+
+control_terms <- c(
+  "log_len",
+  "is_political",
+  "log_images",
+  "log_links",
+  "log_tags",
+  "is_weekend"
+)
+
+controls <- paste(control_terms, collapse = " + ")
+fe_main <- "category + month"
+fe_author <- "category + month + author"
+
+thesis_cols <- c(
+  "True-side claims only" = "#4E79A7",
+  "At least 1 misleading claim" = "#E15759"
+)
+
+interaction_cols <- c(
+  "1 misleading claim" = "#4E79A7",
+  "2 misleading claims" = "#59A14F",
+  "3 misleading claims" = "#E15759"
+)
+
+theme_thesis <- function(base_size = 11) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      plot.subtitle = element_text(size = rel(0.95)),
+      axis.title = element_text(face = "bold"),
+      legend.title = element_text(face = "bold"),
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_blank(),
+      strip.text = element_text(face = "bold")
+    )
+}
+
+save_plot_both <- function(plot_object, file_stub, width = 8, height = 5, dpi = 300) {
+  ggsave(
+    filename = file.path(fig_png_dir, paste0(file_stub, ".png")),
+    plot = plot_object,
+    width = width,
+    height = height,
+    dpi = dpi
+  )
+  ggsave(
+    filename = file.path(fig_pdf_dir, paste0(file_stub, ".pdf")),
+    plot = plot_object,
+    width = width,
+    height = height,
+    dpi = dpi,
+    device = cairo_pdf
+  )
+}
+
+# Set to FALSE to skip PDF table export entirely. This makes rendering the
+# fastest it can be and fully avoids calling webshot2/Chrome, so the
+# "... screenshot completed" progress text can never appear. HTML tables are
+# still written and the inline tabbed tables still render.
+export_table_pdf <- TRUE
+
+# Run an expression while swallowing every side channel: standard output,
+# messages, and warnings. webshot2 prints progress text such as
+# "file:///... screenshot completed" while producing a PDF. Inside a
+# results = "asis" block that text leaks into the document and breaks the gt
+# HTML that follows it. Routing every gtsave call through this keeps the
+# rendered output clean.
+run_silently <- function(expr) {
+  tf <- tempfile()
+  con <- file(tf, open = "wt")
+  sink(con, type = "output")
+  sink(con, type = "message")
+  on.exit(
+    {
+      sink(type = "message")
+      sink(type = "output")
+      close(con)
+      unlink(tf)
+    },
+    add = TRUE
+  )
+  invisible(suppressMessages(suppressWarnings(force(expr))))
+}
+
+save_gt_table <- function(table_object, file_stub) {
+  html_path <- file.path(html_dir, paste0(file_stub, ".html"))
+  pdf_path <- file.path(pdf_dir, paste0(file_stub, ".pdf"))
+
+  run_silently(gt::gtsave(table_object, html_path))
+
+  if (isTRUE(export_table_pdf)) {
+    tryCatch(
+      run_silently(
+        gt::gtsave(
+          table_object,
+          pdf_path,
+          expand = 10,
+          vwidth = 1400
+        )
+      ),
+      error = function(e) {
+        message(
+          "Could not export PDF ", basename(pdf_path), ". ",
+          "Install webshot2 and make sure Chrome/Chromium is available. ",
+          "Original error: ", conditionMessage(e)
+        )
+      }
+    )
+  }
+
+  invisible(table_object)
+}
+
+# PDF export through gt::gtsave requires webshot2 and Chrome/Chromium.
+if (!requireNamespace("webshot2", quietly = TRUE)) {
+  message(
+    "PDF export requires webshot2. Install once with: ",
+    "install.packages('webshot2')"
+  )
+}
+```
+
+# 1. Load and prepare the data
+
+```{r}
+#| label: prepare-data
+
+raw_data <- read_parquet(data_path) |>
+  as_tibble()
+
+required_columns <- c(
+  "doc_id", "author",
+  "analysis_sample_body", "analysis_sample_title_robustness",
+  "misleading_claim_count", "title_misleading",
+  "net_votes", "reblogs", "payout",
+  "comments", "upvotes", "downvotes", "distinct_voters",
+  "log_len", "is_political", "category", "month",
+  "n_images", "n_links", "n_tags", "is_weekend",
+  emotion_vars,
+  standing_vars,
+  "pre_avg_reward", "log_pre_avg_reward",
+  vad_vars, "vad_n_matched"
+)
+
+missing_columns <- setdiff(required_columns, names(raw_data))
+if (length(missing_columns) > 0) {
+  stop(
+    "The regression dataset is missing required columns: ",
+    paste(missing_columns, collapse = ", ")
+  )
+}
+
+z_score <- function(x) {
+  x <- as.numeric(x)
+  s <- sd(x, na.rm = TRUE)
+  if (is.na(s) || s == 0) return(rep(NA_real_, length(x)))
+  as.numeric((x - mean(x, na.rm = TRUE)) / s)
+}
+
+
+model_data <- raw_data |>
+  filter(analysis_sample_body %in% TRUE) |>
+  mutate(
+    misleading_claim_count = as.integer(misleading_claim_count),
+    misleading_n_f = factor(misleading_claim_count, levels = 0:3),
+    any_misleading_claim = as.integer(misleading_claim_count > 0),
+    claim_screen_group = factor(
+      if_else(
+        any_misleading_claim == 1,
+        "At least 1 misleading claim",
+        "True-side claims only"
+      ),
+      levels = c("True-side claims only", "At least 1 misleading claim")
+    ),
+    title_misleading = as.numeric(title_misleading),
+
+    net_votes = as.numeric(net_votes),
+    reblogs = as.numeric(reblogs),
+    payout = as.numeric(payout),
+    comments = as.numeric(comments),
+    upvotes = as.numeric(upvotes),
+    downvotes = as.numeric(downvotes),
+    distinct_voters = as.numeric(distinct_voters),
+
+    log_net_votes = log1p(pmax(net_votes, 0)),
+    log_reblogs = log1p(pmax(reblogs, 0)),
+    any_reblog = as.integer(reblogs > 0),
+    log_payout = log1p(pmax(payout, 0)),
+    log_comments = log1p(pmax(comments, 0)),
+    log_upvotes = log1p(pmax(upvotes, 0)),
+    log_downvotes = log1p(pmax(downvotes, 0)),
+    log_distinct_voters = log1p(pmax(distinct_voters, 0)),
+
+    log_len = as.numeric(log_len),
+    is_political = as.numeric(is_political),
+    log_images = log1p(pmax(as.numeric(n_images), 0)),
+    log_links = log1p(pmax(as.numeric(n_links), 0)),
+    log_tags = log1p(pmax(as.numeric(n_tags), 0)),
+    is_weekend = as.numeric(is_weekend),
+
+    category = factor(na_if(trimws(as.character(category)), "")),
+    month = factor(na_if(trimws(as.character(month)), "")),
+    month_chr = as.character(month),
+    author = factor(na_if(trimws(as.character(author)), "")),
+
+    across(all_of(emotion_vars), ~ as.numeric(.x)),
+    across(all_of(emotion_vars), ~ z_score(.x), .names = "{.col}_z"),
+
+    across(all_of(vad_vars), ~ as.numeric(.x)),
+    across(all_of(vad_vars), ~ z_score(.x), .names = "{.col}_z"),
+
+    across(
+      any_of(c(standing_vars, "pre_avg_reward", "log_pre_avg_reward")),
+      ~ as.numeric(.x)
+    )
+  )
+
+invalid_counts <- setdiff(unique(na.omit(model_data$misleading_claim_count)), 0:3)
+if (length(invalid_counts) > 0) {
+  stop(
+    "Unexpected misleading_claim_count values: ",
+    paste(invalid_counts, collapse = ", ")
+  )
+}
+
+standing_coverage <- model_data |>
+  summarise(
+    across(
+      all_of(standing_vars),
+      ~ sum(!is.na(.x)),
+      .names = "nonmissing_{.col}"
+    )
+  )
+
+if (any(unlist(standing_coverage) != nrow(model_data))) {
+  stop(
+    "Pre-window author-standing coverage is incomplete in the body-only ",
+    "main sample. Rebuild the dataset with build_regression_dataset_final.py."
+  )
+}
+
+# H1 samples do not depend on emotion availability.
+h1_required <- c(
+  "misleading_n_f", control_terms,
+  "category", "month", "author"
+)
+
+h1_votes_data <- model_data |>
+  drop_na(all_of(c("log_net_votes", h1_required)))
+
+h1_reblog_data <- model_data |>
+  drop_na(all_of(c("any_reblog", h1_required)))
+
+h1_payout_data <- model_data |>
+  drop_na(all_of(c("log_payout", h1_required)))
+
+get_h2_data <- function(outcome, emotion) {
+  model_data |>
+    drop_na(all_of(c(outcome, h1_required, paste0(emotion, "_z"))))
+}
+
+get_title_data <- function(outcome) {
+  base_data <- switch(
+    outcome,
+    log_net_votes = h1_votes_data,
+    any_reblog = h1_reblog_data,
+    log_payout = h1_payout_data,
+    stop("Unknown outcome: ", outcome)
+  )
+
+  base_data |>
+    filter(
+      analysis_sample_title_robustness %in% TRUE,
+      !is.na(title_misleading)
+    )
+}
+
+month_levels <- sort(unique(na.omit(model_data$month_chr)))
+model_data <- model_data |>
+  mutate(month_f = factor(month_chr, levels = month_levels))
+
+# Dominant emotion descriptive helper.
+dominant_emotion_fun <- function(df, emotion_columns) {
+  mat <- as.matrix(df[, emotion_columns])
+  idx <- max.col(mat, ties.method = "first")
+  out <- emotion_columns[idx]
+  out[apply(mat, 1, function(x) all(is.na(x)))] <- NA_character_
+  out
+}
+
+model_data$dominant_emotion <- dominant_emotion_fun(
+  model_data,
+  emotion_vars
+)
+
+model_data <- model_data |>
+  mutate(
+    dominant_emotion = factor(
+      dominant_emotion,
+      levels = emotion_vars,
+      labels = unname(emotion_labels[emotion_vars])
+    )
+  )
+```
+
+## 1.1 Sample audit
+
+```{r}
+#| label: sample-audit
+
+audit_table <- tibble(
+  Metric = c(
+    "Posts in body-only main sample",
+    "Posts in title robustness sample",
+    "Authors in body-only sample",
+    "Posts with negative net votes",
+    "Posts with comments available",
+    "Posts with upvotes available",
+    "Posts with downvotes available",
+    "Posts with distinct voters available",
+    "Posts with complete pre-window standing"
+  ),
+  Value = c(
+    nrow(model_data),
+    sum(model_data$analysis_sample_title_robustness %in% TRUE, na.rm = TRUE),
+    n_distinct(model_data$author),
+    sum(model_data$net_votes < 0, na.rm = TRUE),
+    sum(!is.na(model_data$comments)),
+    sum(!is.na(model_data$upvotes)),
+    sum(!is.na(model_data$downvotes)),
+    sum(!is.na(model_data$distinct_voters)),
+    sum(complete.cases(model_data[, standing_vars]))
+  )
+)
+
+audit_table
+```
+
+```{r}
+# =============================================================================
+# Table D0. Univariate descriptive statistics
+# -----------------------------------------------------------------------------
+# Paste into hive_regression.qmd immediately AFTER section "1.1 Sample audit"
+# and BEFORE "2. Descriptive statistics and figures", inside a chunk header:
+#
+#   ```{r table-D0-descriptives}
+#   ...paste this file...
+#   ```
+#
+# Requires: model_data (already built), dplyr, tibble, gt.
+# Nothing here modifies model_data.
+# =============================================================================
+
+# --- 1. Variable label map ---------------------------------------------------
+# Grouped in the order a reader meets them: outcomes, then the H2 measures,
+# then controls, then author history. Names are matched against model_data,
+# so any variable absent from the data is silently skipped rather than erroring.
+
+desc_spec <- tibble::tribble(
+  ~block,               ~var,                    ~label,
+  "Outcomes (raw)",     "net_votes",             "Net votes",
+  "Outcomes (raw)",     "reblogs",               "Reblogs",
+  "Outcomes (raw)",     "payout",                "Payout (HBD)",
+  "Outcomes (raw)",     "comments",              "Comments",
+  "Outcomes (raw)",     "upvotes",               "Upvotes",
+  "Outcomes (raw)",     "downvotes",             "Downvotes",
+  "Outcomes (raw)",     "distinct_voters",       "Distinct voters",
+  "Outcomes (modelled)","log_net_votes",         "Log net votes",
+  "Outcomes (modelled)","any_reblog",            "Any reblog (0/1)",
+  "Outcomes (modelled)","log_payout",            "Log payout",
+  "Emotional language", "anger",                 "Anger",
+  "Emotional language", "disgust",               "Disgust",
+  "Emotional language", "fear",                  "Fear",
+  "Emotional language", "joy",                   "Joy",
+  "Emotional language", "sadness",               "Sadness",
+  "Emotional language", "surprise",              "Surprise",
+  "Lexicon (NRC-VAD)",  "valence",               "Valence",
+  "Lexicon (NRC-VAD)",  "arousal",               "Arousal",
+  "Lexicon (NRC-VAD)",  "dominance",             "Dominance",
+  "Lexicon (NRC-VAD)",  "vad_n_matched",         "Matched lexicon words",
+  "Controls",           "log_len",               "Log post length",
+  "Controls",           "n_images",              "Images",
+  "Controls",           "n_links",               "Links",
+  "Controls",           "n_tags",                "Tags",
+  "Controls",           "is_political",          "Political post (0/1)",
+  "Controls",           "is_weekend",            "Weekend post (0/1)",
+  "Author history",     "pre_avg_reward",        "Pre-window average author reward"
+)
+
+# Append the pre-window standing variables if they are present under the
+# names used elsewhere in the file.
+standing_labels <- c(
+  log_pre_rewards  = "Log pre-window cumulative author rewards",
+  log_pre_curation = "Log pre-window cumulative curation rewards",
+  log_pre_posts    = "Log pre-window post count",
+  log_acct_age     = "Log pre-window account age"
+)
+
+desc_spec <- dplyr::bind_rows(
+  desc_spec,
+  tibble::tibble(
+    block = "Author history",
+    var   = names(standing_labels),
+    label = unname(standing_labels)
+  )
+)
+
+desc_spec <- desc_spec[desc_spec$var %in% names(model_data), ]
+
+# --- 2. Compute the statistics ----------------------------------------------
+
+desc_stats <- purrr::map_dfr(seq_len(nrow(desc_spec)), function(i) {
+  x <- as.numeric(model_data[[desc_spec$var[i]]])
+  tibble::tibble(
+    block  = desc_spec$block[i],
+    Label  = desc_spec$label[i],
+    N      = sum(!is.na(x)),
+    Mean   = mean(x, na.rm = TRUE),
+    SD     = stats::sd(x, na.rm = TRUE),
+    Min    = min(x, na.rm = TRUE),
+    Median = stats::median(x, na.rm = TRUE),
+    Max    = max(x, na.rm = TRUE)
+  )
+})
+
+# --- 3. Render -------------------------------------------------------------
+
+table_D0 <- desc_stats |>
+  gt::gt(groupname_col = "block", rowname_col = "Label") |>
+  gt::tab_header(
+    title = "Table D0. Descriptive statistics for the analysis sample"
+  ) |>
+  gt::fmt_number(columns = c("Mean", "SD", "Min", "Median", "Max"),
+                 decimals = 3) |>
+  gt::fmt_number(columns = "N", decimals = 0, use_seps = TRUE) |>
+  gt::tab_source_note(
+    gt::md(
+      paste(
+        "*Note.* All statistics are computed on the 5,245-post body-only",
+        "analysis sample. Raw outcomes are reported alongside the",
+        "transformations entered into the models. The six emotional-language",
+        "scores are softmax probabilities on the raw scale and are",
+        "standardized within each regression. The lexicon dimensions range",
+        "from 0 to 1 and are likewise standardized in the models."
+      )
+    )
+  )
+
+table_D0
+
+# --- 4. Author counts to report in the text ---------------------------------
+# These resolve the gap between the N in the fixed effects columns and the
+# identifying sample described in the methodology chapter.
+
+fe_data <- model_data |>
+  dplyr::group_by(author) |>
+  dplyr::filter(dplyr::n() > 1) |>
+  dplyr::ungroup()
+
+varying_data <- model_data |>
+  dplyr::group_by(author) |>
+  dplyr::filter(dplyr::n_distinct(misleading_claim_count) > 1) |>
+  dplyr::ungroup()
+
+cat("Full sample:      ", nrow(model_data), "posts,",
+    dplyr::n_distinct(model_data$author), "authors\n")
+cat("Author FE sample: ", nrow(fe_data), "posts,",
+    dplyr::n_distinct(fe_data$author), "authors\n")
+cat("Identifying set:  ", nrow(varying_data), "posts,",
+    dplyr::n_distinct(varying_data$author), "authors\n")
+cat("Single-post authors:",
+    sum(table(model_data$author) == 1), "\n")
+```
+
+
+# 2. Descriptive statistics and figures
+
+These analyses are descriptive. The formal tests of H1 and H2 are the regression models below.
+
+## 2.1 Distribution of posts by misleading-claim count
+
+```{r}
+#| label: desc-claim-count
+#| fig-width: 7
+#| fig-height: 4.5
+
+p_claim_count <- model_data |>
+  count(misleading_claim_count) |>
+  ggplot(aes(x = factor(misleading_claim_count), y = n, fill = factor(misleading_claim_count))) +
+  geom_col(width = 0.7, show.legend = FALSE) +
+  geom_text(aes(label = comma(n)), vjust = -0.35, fontface = "bold", size = 3.6) +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.08))) +
+  scale_fill_brewer(palette = "Blues") +
+  labs(
+    title = "Posts by misleading body-claim count",
+    x = "Number of asserted misleading body claims",
+    y = "Number of posts"
+  ) +
+  theme_thesis(11)
+
+save_plot_both(p_claim_count, "D1_posts_by_claim_count", 7, 4.5)
+p_claim_count
+```
+
+## 2.2 Candidate dependent variables by misleading-claim category
+
+These descriptives do not classify entire posts as true or misinformation. The four groups refer only to the number of asserted misleading body claims identified among the classified extracted claims. The pairwise Welch tests compare one, two, and three misleading claims separately with the zero-claim reference group, matching the categorical structure of the regressions.
+
+```{r}
+#| label: claim-category-helpers
+
+claim_category_means <- function(data, vars, labels) {
+  map_dfr(vars, function(v) {
+    d <- data |>
+      transmute(
+        misleading_claim_count,
+        value = as.numeric(.data[[v]])
+      ) |>
+      filter(
+        misleading_claim_count %in% 0:3,
+        is.finite(value)
+      )
+
+    tibble(
+      Variable = v,
+      Label = unname(labels[[v]]),
+      `Mean: 0 claims` = mean(d$value[d$misleading_claim_count == 0]),
+      `Mean: 1 claim` = mean(d$value[d$misleading_claim_count == 1]),
+      `Mean: 2 claims` = mean(d$value[d$misleading_claim_count == 2]),
+      `Mean: 3 claims` = mean(d$value[d$misleading_claim_count == 3]),
+      `N: 0 claims` = sum(d$misleading_claim_count == 0),
+      `N: 1 claim` = sum(d$misleading_claim_count == 1),
+      `N: 2 claims` = sum(d$misleading_claim_count == 2),
+      `N: 3 claims` = sum(d$misleading_claim_count == 3)
+    )
+  })
+}
+
+claim_pairwise_ttests <- function(data, vars, labels) {
+  map_dfr(vars, function(v) {
+    d <- data |>
+      transmute(
+        misleading_claim_count,
+        value = as.numeric(.data[[v]])
+      ) |>
+      filter(
+        misleading_claim_count %in% 0:3,
+        is.finite(value)
+      )
+
+    reference <- d$value[d$misleading_claim_count == 0]
+
+    map_dfr(1:3, function(claim_level) {
+      comparison <- d$value[d$misleading_claim_count == claim_level]
+
+      if (length(reference) < 2 || length(comparison) < 2) {
+        return(NULL)
+      }
+
+      test <- t.test(comparison, reference)
+
+      tibble(
+        Variable = v,
+        Label = unname(labels[[v]]),
+        Comparison = paste0(claim_level, " vs 0 claims"),
+        Difference = mean(comparison) - mean(reference),
+        `t statistic` = unname(test$statistic),
+        `p-value` = test$p.value,
+        `CI low` = test$conf.int[1],
+        `CI high` = test$conf.int[2],
+        `N: comparison` = length(comparison),
+        `N: 0 claims` = length(reference)
+      )
+    })
+  })
+}
+```
+
+### 2.2.1 All potential dependent variables
+
+```{r}
+#| label: tt-outcomes
+
+dv_candidates <- c(
+  log_payout = "Payout",
+  log_net_votes = "Net votes",
+  log_comments = "Comments",
+  log_reblogs = "Reblogs (log count)",
+  any_reblog = "Any reblog",
+  log_downvotes = "Downvotes",
+  log_distinct_voters = "Distinct voters",
+  log_upvotes = "Upvotes"
+)
+
+available_dv <- names(dv_candidates)[
+  names(dv_candidates) %in% names(model_data)
+]
+
+dv_category_means <- claim_category_means(
+  model_data,
+  available_dv,
+  dv_candidates
+)
+
+dv_category_means_gt <- dv_category_means |>
+  select(-Variable) |>
+  gt() |>
+  fmt_number(columns = starts_with("Mean:"), decimals = 3) |>
+  fmt_integer(columns = starts_with("N:")) |>
+  tab_header(
+    title = "Table D1A. Candidate dependent-variable means by misleading-claim category"
+  ) |>
+  tab_source_note(
+    md(
+      "Note. Zero claims is not labelled as a true or fully accurate article. It means that none of the classified asserted claims extracted from the post were coded as misleading."
+    )
+  )
+
+dv_category_means_gt
+save_gt_table(
+  dv_category_means_gt,
+  "Table_D1A_candidate_DV_means_by_claim_category"
+)
+```
+
+```{r}
+#| label: tt-outcomes-pairwise
+
+dv_pairwise_tests <- claim_pairwise_ttests(
+  model_data,
+  available_dv,
+  dv_candidates
+)
+
+dv_pairwise_tests_gt <- dv_pairwise_tests |>
+  select(-Variable) |>
+  gt(groupname_col = "Label") |>
+  fmt_number(
+    columns = c(Difference, `t statistic`, `p-value`, `CI low`, `CI high`),
+    decimals = 3
+  ) |>
+  fmt_integer(columns = starts_with("N:")) |>
+  tab_header(
+    title = "Table D1B. Welch t-tests: each misleading-claim category versus zero claims"
+  ) |>
+  tab_source_note(
+    md(
+      "Note. Each comparison is estimated separately: one versus zero, two versus zero, and three versus zero misleading asserted body claims. These are descriptive tests; the regression models provide the main inference."
+    )
+  )
+
+dv_pairwise_tests_gt
+save_gt_table(
+  dv_pairwise_tests_gt,
+  "Table_D1B_candidate_DV_pairwise_t_tests"
+)
+```
+
+### 2.2.2 Six discrete emotional-language dimensions
+
+```{r}
+#| label: tt-emotions
+
+emotion_category_means <- claim_category_means(
+  model_data,
+  emotion_vars,
+  emotion_labels
+)
+
+emotion_category_means_gt <- emotion_category_means |>
+  select(-Variable) |>
+  gt() |>
+  fmt_number(columns = starts_with("Mean:"), decimals = 3) |>
+  fmt_integer(columns = starts_with("N:")) |>
+  tab_header(
+    title = "Table D2A. Emotional-language means by misleading-claim category"
+  ) |>
+  tab_source_note(
+    md(
+      "Note. The six DistilRoBERTa emotional-language dimensions are shown separately."
+    )
+  )
+
+emotion_category_means_gt
+save_gt_table(
+  emotion_category_means_gt,
+  "Table_D2A_emotion_means_by_claim_category"
+)
+```
+
+```{r}
+#| label: tt-emotions-pairwise
+
+emotion_pairwise_tests <- claim_pairwise_ttests(
+  model_data,
+  emotion_vars,
+  emotion_labels
+)
+
+emotion_pairwise_tests_gt <- emotion_pairwise_tests |>
+  select(-Variable) |>
+  gt(groupname_col = "Label") |>
+  fmt_number(
+    columns = c(Difference, `t statistic`, `p-value`, `CI low`, `CI high`),
+    decimals = 3
+  ) |>
+  fmt_integer(columns = starts_with("N:")) |>
+  tab_header(
+    title = "Table D2B. Emotional-language Welch t-tests versus zero claims"
+  ) |>
+  tab_source_note(
+    md(
+      "Note. One-, two-, and three-claim groups are each compared separately with the zero-claim reference group."
+    )
+  )
+
+emotion_pairwise_tests_gt
+save_gt_table(
+  emotion_pairwise_tests_gt,
+  "Table_D2B_emotion_pairwise_t_tests"
+)
+```
+
+## 2.3 Correlation matrix
+
+The categorical misleading-claim predictor is intentionally omitted from the Pearson correlation matrix. Treating the values 0, 1, 2, and 3 as a single continuous scale would impose a linear and equal-distance relationship that the regression design does not assume.
+
+```{r}
+#| label: table-D-corr
+#| fig-width: 13
+#| fig-height: 11
+
+corr_candidates <- model_data |>
+  transmute(
+    Payout          = log_payout,
+    `Net votes`     = log_net_votes,
+    Upvotes         = log_upvotes,
+    `Distinct voters` = log_distinct_voters,
+    Comments        = log_comments,
+    Reblogs         = log_reblogs,
+    `Any reblog`    = any_reblog,
+    Downvotes       = log_downvotes,
+    Anger           = anger,
+    Disgust         = disgust,
+    Fear            = fear,
+    Joy             = joy,
+    Sadness         = sadness,
+    Surprise        = surprise,
+    Images          = log_images,
+    Links           = log_links,
+    Tags            = log_tags,
+    Weekend         = is_weekend,
+    `Post length`   = log_len,
+    Political       = is_political
+  ) |>
+  mutate(across(everything(), as.numeric))
+
+# Remove variables that are completely missing or have no variation.
+valid_corr_vars <- names(corr_candidates)[
+  map_lgl(
+    corr_candidates,
+    ~ sum(!is.na(.x)) > 1 &&
+      sd(.x, na.rm = TRUE) > 0
+  )
+]
+
+corr_candidates <- corr_candidates |>
+  select(all_of(valid_corr_vars))
+
+M <- cor(
+  corr_candidates,
+  use = "pairwise.complete.obs"
+)
+
+p_corr <- ggcorrplot(
+  M,
+  type = "lower",                # Avoid repeating the same correlations twice
+  show.diag = TRUE,
+  lab = TRUE,
+  lab_size = 2.7,
+  lab_col = "grey20",
+  tl.cex = 10,
+  tl.srt = 45,
+  colors = c("#6BAED6", "white", "#FB6A4A"),
+  outline.color = "white",
+  legend.title = "r",
+  title = "Correlations: candidate outcomes, emotional language, and controls"
+) +
+  coord_fixed() +
+  theme_thesis(10) +
+  theme(
+    axis.title = element_blank(),
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1,
+      vjust = 1,
+      size = 9
+    ),
+    axis.text.y = element_text(
+      size = 9
+    ),
+    plot.title = element_text(
+      face = "bold",
+      size = 15,
+      hjust = 0
+    ),
+    plot.margin = margin(
+      t = 12,
+      r = 18,
+      b = 28,
+      l = 18
+    ),
+    legend.position = "right"
+  )
+
+save_plot_both(
+  p_corr,
+  "D3_correlations_matrix",
+  width = 13,
+  height = 11
+)
+
+p_corr
+```
+
+## 2.4 Posts per month by claim-screen group
+
+```{r}
+#| label: desc-time
+#| fig-width: 8
+#| fig-height: 4.5
+
+mon <- model_data |>
+  count(month_f, claim_screen_group)
+
+p_month_counts <- ggplot(mon, aes(month_f, n, fill = claim_screen_group)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_text(
+    aes(label = comma(n)),
+    position = position_dodge(width = 0.8),
+    vjust = -0.35,
+    fontface = "bold",
+    size = 3.2
+  ) +
+  scale_fill_manual(values = thesis_cols, name = NULL) +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.1))) +
+  labs(
+    title = "Posts per month by presence of asserted misleading claims",
+    subtitle = "This descriptive grouping does not classify posts as true versus misinformation",
+    x = NULL,
+    y = "Number of posts"
+  ) +
+  theme_thesis(11)
+
+save_plot_both(p_month_counts, "D4_posts_by_month_grouped", 8, 4.5)
+p_month_counts
+```
+
+## 2.5 Average engagement by dominant emotion and claim-screen group
+
+```{r}
+#| label: dominant-emotion-engagement
+#| fig-width: 10
+#| fig-height: 5
+
+dom_emotion_plot_data <- model_data |>
+  filter(!is.na(dominant_emotion)) |>
+  group_by(dominant_emotion, claim_screen_group) |>
+  summarise(
+    mean_log_net_votes = mean(log_net_votes, na.rm = TRUE),
+    reblog_rate = mean(any_reblog, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  ) |>
+  pivot_longer(
+    cols = c(mean_log_net_votes, reblog_rate),
+    names_to = "metric",
+    values_to = "value"
+  ) |>
+  mutate(
+    metric = recode(
+      metric,
+      mean_log_net_votes = "Average log net votes",
+      reblog_rate = "Reblog rate"
+    )
+  )
+
+p_dom_emotion <- ggplot(
+  dom_emotion_plot_data,
+  aes(dominant_emotion, value, fill = claim_screen_group)
+) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  facet_wrap(~ metric, scales = "free_y") +
+  scale_fill_manual(values = thesis_cols, name = NULL) +
+  labs(
+    title = "Average engagement by dominant emotion and claim-screen group",
+    subtitle = "Groups indicate zero versus at least one asserted misleading body claim; they are not whole-article truth labels",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_thesis(11) +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+
+save_plot_both(p_dom_emotion, "D5_engagement_by_dominant_emotion_and_claim_group", 10, 5)
+p_dom_emotion
+```
+
+## 2.6 Additional descriptive figure: outcomes by misleading-claim count
+
+```{r}
+#| label: outcomes-by-claim-count
+#| fig-width: 10
+#| fig-height: 4.5
+
+outcomes_by_claim <- model_data |>
+  group_by(misleading_claim_count) |>
+  summarise(
+    `Average log net votes` = mean(log_net_votes, na.rm = TRUE),
+    `Reblog rate` = mean(any_reblog, na.rm = TRUE),
+    `Average log payout` = mean(log_payout, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  pivot_longer(
+    cols = -misleading_claim_count,
+    names_to = "metric",
+    values_to = "value"
+  )
+
+p_outcomes_by_claim <- ggplot(
+  outcomes_by_claim,
+  aes(factor(misleading_claim_count), value, fill = factor(misleading_claim_count))
+) +
+  geom_col(show.legend = FALSE, width = 0.7) +
+  facet_wrap(~ metric, scales = "free_y") +
+  scale_fill_brewer(palette = "Blues") +
+  labs(
+    title = "Average outcomes by misleading body-claim count",
+    x = "Number of asserted misleading body claims",
+    y = NULL
+  ) +
+  theme_thesis(11)
+
+save_plot_both(p_outcomes_by_claim, "D6_outcomes_by_claim_count", 10, 4.5)
+p_outcomes_by_claim
+```
+
+```{r}
+calculate_concentration <- function(data, outcome, outcome_label) {
+
+  author_totals <- data |>
+    group_by(author) |>
+    summarise(
+      value = sum(
+        pmax(.data[[outcome]], 0),
+        na.rm = TRUE
+      ),
+      n_posts = n(),
+      .groups = "drop"
+    ) |>
+    arrange(value)
+
+  total_value <- sum(author_totals$value, na.rm = TRUE)
+  n_authors <- nrow(author_totals)
+
+  if (n_authors == 0 || total_value <= 0) {
+    stop(
+      paste0(
+        "Gini cannot be calculated for ",
+        outcome_label,
+        " because there are no positive values."
+      )
+    )
+  }
+
+  gini <- (
+    2 * sum(seq_len(n_authors) * author_totals$value) /
+      (n_authors * total_value)
+  ) -
+    (n_authors + 1) / n_authors
+
+  lorenz_data <- author_totals |>
+    mutate(
+      cumulative_authors = row_number() / n_authors,
+      cumulative_value = cumsum(value) / total_value
+    ) |>
+    add_row(
+      author = NA_character_,
+      value = 0,
+      n_posts = 0,
+      cumulative_authors = 0,
+      cumulative_value = 0,
+      .before = 1
+    )
+
+  plot <- ggplot(
+    lorenz_data,
+    aes(
+      x = cumulative_authors,
+      y = cumulative_value
+    )
+  ) +
+    geom_abline(
+      slope = 1,
+      intercept = 0,
+      linetype = "dashed",
+      colour = "grey60"
+    ) +
+    geom_line(
+      colour = "#B2182B",
+      linewidth = 1.1
+    ) +
+    annotate(
+      "text",
+      x = 0.04,
+      y = 0.92,
+      hjust = 0,
+      label = sprintf("Gini = %.2f", gini),
+      fontface = "bold",
+      size = 4.2
+    ) +
+    scale_x_continuous(
+      labels = scales::percent,
+      limits = c(0, 1)
+    ) +
+    scale_y_continuous(
+      labels = scales::percent,
+      limits = c(0, 1)
+    ) +
+    labs(
+      title = paste0(
+        outcome_label,
+        " is concentrated among a small group of authors"
+      ),
+      subtitle = paste0(
+        "Cumulative distribution across authors; ",
+        "the dashed line represents perfect equality"
+      ),
+      x = "Cumulative share of authors",
+      y = paste(
+        "Cumulative share of",
+        tolower(outcome_label)
+      )
+    ) +
+    theme_thesis(11)
+
+  list(
+    gini = gini,
+    author_totals = author_totals,
+    lorenz_data = lorenz_data,
+    plot = plot
+  )
+}
+```
+
+```{r}
+#| label: author-concentration-plots
+#| fig-width: 10
+#| fig-height: 6
+
+net_vote_concentration <- calculate_concentration(
+  model_data,
+  "net_votes",
+  "Net votes"
+)
+
+payout_concentration <- calculate_concentration(
+  model_data,
+  "payout",
+  "Payout"
+)
+
+# Print Gini coefficients
+net_vote_concentration$gini
+payout_concentration$gini
+
+# Create an output folder
+dir.create(
+  "figures",
+  showWarnings = FALSE,
+  recursive = TRUE
+)
+
+# Save as high-resolution PNG files
+ggsave(
+  filename = "figures/D8_net_votes_author_concentration.png",
+  plot = net_vote_concentration$plot,
+  width = 10,
+  height = 6,
+  dpi = 300,
+  bg = "white"
+)
+
+ggsave(
+  filename = "figures/D9_payout_author_concentration.png",
+  plot = payout_concentration$plot,
+  width = 10,
+  height = 6,
+  dpi = 300,
+  bg = "white"
+)
+
+# Display plots in the document
+net_vote_concentration$plot
+payout_concentration$plot
+```
+
+# 3. Regression and export helpers
+
+```{r}
+#| label: helpers
+
+fit_model <- function(outcome, rhs, data, fixed_effects = NULL) {
+  formula_text <- paste0(
+    outcome,
+    " ~ ",
+    rhs,
+    if (!is.null(fixed_effects)) paste0(" | ", fixed_effects) else ""
+  )
+
+  feols(
+    fml = as.formula(formula_text),
+    data = data,
+    vcov = se_main,
+    notes = FALSE
+  )
+}
+
+fit_main_ladder <- function(outcome, focal_terms, data) {
+  list(
+    "(1) Body only" = fit_model(outcome, focal_terms, data),
+    "(2) + controls" = fit_model(outcome, paste(focal_terms, controls, sep = " + "), data),
+    "(3) + category/month FE" = fit_model(outcome, paste(focal_terms, controls, sep = " + "), data, fe_main),
+    "(4) + author FE" = fit_model(outcome, paste(focal_terms, controls, sep = " + "), data, fe_author)
+  )
+}
+
+fit_title_ladder <- function(outcome, data) {
+  list(
+    "(1) Body only" = fit_model(outcome, "misleading_n_f", data),
+    "(2) + title" = fit_model(outcome, "misleading_n_f + title_misleading", data),
+    "(3) + controls" = fit_model(
+      outcome,
+      paste("misleading_n_f + title_misleading", controls, sep = " + "),
+      data
+    ),
+    "(4) + category/month FE" = fit_model(
+      outcome,
+      paste("misleading_n_f + title_misleading", controls, sep = " + "),
+      data,
+      fe_main
+    ),
+    "(5) + author FE" = fit_model(
+      outcome,
+      paste("misleading_n_f + title_misleading", controls, sep = " + "),
+      data,
+      fe_author
+    )
+  )
+}
+
+control_coef_map <- c(
+  "log_len" = "Log post length",
+  "is_political" = "Political post",
+  "log_images" = "Log number of images",
+  "log_links" = "Log number of links",
+  "log_tags" = "Log number of tags",
+  "is_weekend" = "Weekend post"
+)
+
+h1_coef_map <- c(
+  "misleading_n_f1" = "1 misleading claim",
+  "misleading_n_f2" = "2 misleading claims",
+  "misleading_n_f3" = "3 misleading claims",
+  control_coef_map
+)
+
+title_coef_map <- c(
+  "misleading_n_f1" = "1 misleading claim",
+  "misleading_n_f2" = "2 misleading claims",
+  "misleading_n_f3" = "3 misleading claims",
+  "title_misleading" = "Misleading title",
+  control_coef_map
+)
+
+emotion_coef_map <- function(emotion) {
+  emotion_z <- paste0(emotion, "_z")
+  emotion_label <- emotion_labels[[emotion]]
+
+  c(
+    "misleading_n_f1" = "1 misleading claim",
+    "misleading_n_f2" = "2 misleading claims",
+    "misleading_n_f3" = "3 misleading claims",
+    setNames(paste0(emotion_label, " (z)"), emotion_z),
+    setNames(paste0("1 claim x ", emotion_label), paste0("misleading_n_f1:", emotion_z)),
+    setNames(paste0("2 claims x ", emotion_label), paste0("misleading_n_f2:", emotion_z)),
+    setNames(paste0("3 claims x ", emotion_label), paste0("misleading_n_f3:", emotion_z)),
+    control_coef_map
+  )
+}
+
+specification_rows <- function(model_names, title_model = FALSE) {
+  k <- length(model_names)
+
+  if (title_model) {
+    post_controls <- c("No", "No", "Yes", "Yes", "Yes")
+    category_fe <- c("No", "No", "No", "Yes", "Yes")
+    month_fe <- c("No", "No", "No", "Yes", "Yes")
+    author_fe <- c("No", "No", "No", "No", "Yes")
+  } else {
+    post_controls <- c("No", "Yes", "Yes", "Yes")
+    category_fe <- c("No", "No", "Yes", "Yes")
+    month_fe <- c("No", "No", "Yes", "Yes")
+    author_fe <- c("No", "No", "No", "Yes")
+  }
+
+  rows <- tibble(term = c("Post controls", "Category fixed effects", "Month fixed effects", "Author fixed effects"))
+  for (i in seq_along(model_names)) {
+    rows[[model_names[i]]] <- c(post_controls[i], category_fe[i], month_fe[i], author_fe[i])
+  }
+  rows
+}
+
+make_regression_table <- function(models, coef_map, title, note, file_stub,
+                                  title_model = FALSE, spec_rows = NULL) {
+  model_names <- names(models)
+
+  if (is.null(spec_rows)) {
+    spec_rows <- specification_rows(model_names, title_model)
+  }
+
+  table_object <- modelsummary(
+    models,
+    stars = c("+" = 0.10, "*" = 0.05, "**" = 0.01, "***" = 0.001),
+    coef_map = coef_map,
+    statistic = "({std.error})",
+    fmt = 3,
+    gof_map = tribble(
+      ~raw, ~clean, ~fmt,
+      "nobs", "Num. Obs.", 0,
+      "r.squared", "R-squared", 3,
+      "r2.within", "Within R-squared", 3
+    ),
+    add_rows = spec_rows,
+    output = "gt",
+    title = title,
+    escape = FALSE
+  ) |>
+    tab_source_note(source_note = md(note)) |>
+    tab_source_note(source_note = md(
+      "Notes: + p < 0.10; * p < 0.05; ** p < 0.01; *** p < 0.001. HC1 heteroskedasticity-robust standard errors in parentheses."
+    )) |>
+    tab_options(
+      table.font.size = px(11),
+      data_row.padding = px(3),
+      heading.title.font.size = px(15),
+      heading.title.font.weight = "bold",
+      column_labels.font.weight = "bold"
+    )
+
+  save_gt_table(table_object, file_stub)
+  table_object
+}
+```
+
+# 4. H1: Misleading claims and engagement
+
+The reference category is zero misleading body claims among posts with at least one classified asserted body claim.
+
+## 4.1 Net votes
+
+```{r}
+#| label: h1-net-votes
+
+h1_votes_models <- fit_main_ladder("log_net_votes", "misleading_n_f", h1_votes_data)
+
+make_regression_table(
+  h1_votes_models,
+  h1_coef_map,
+  "Table 1A. Misleading claims and net votes",
+  paste0(
+    "The dependent variable is log(1 + max(net votes, 0)). Post controls are log post length, political-post status, log images, log links, log tags, and weekend posting. Individual category, month, and author coefficients are absorbed and are therefore reported as fixed-effect indicators rather than printed separately."
+  ),
+  "Table_1A_H1_net_votes"
+)
+```
+
+## 4.2 Reblog probability
+
+```{r}
+#| label: h1-reblogs
+
+h1_reblog_models <- fit_main_ladder("any_reblog", "misleading_n_f", h1_reblog_data)
+
+make_regression_table(
+  h1_reblog_models,
+  h1_coef_map,
+  "Table 1B. Misleading claims and reblog probability",
+  paste0(
+    "The dependent variable equals one when a post received at least one reblog. The models are linear probability models. Post controls are log post length, political-post status, log images, log links, log tags, and weekend posting."
+  ),
+  "Table_1B_H1_any_reblog"
+)
+```
+
+# 5. H2: Discrete-emotion moderation
+
+Each emotion is estimated separately. Every table follows the same four-model ladder used for H1.
+
+```{r}
+#| label: estimate-h2
+
+fit_h2_ladder <- function(outcome, emotion) {
+  emotion_z <- paste0(emotion, "_z")
+  data <- get_h2_data(outcome, emotion)
+  fit_main_ladder(outcome, paste0("misleading_n_f * ", emotion_z), data)
+}
+
+h2_models <- set_names(
+  map(
+    emotion_vars,
+    function(emotion) {
+      list(
+        log_net_votes = fit_h2_ladder("log_net_votes", emotion),
+        any_reblog = fit_h2_ladder("any_reblog", emotion)
+      )
+    }
+  ),
+  emotion_vars
+)
+```
+
+```{r}
+#| label: h2-net-votes-build
+
+# Build and save the tables here, outside the results = "asis" block. Any
+# webshot2 progress text produced by save_gt_table stays contained in this
+# ordinary chunk instead of leaking into the tabbed output below.
+h2_netvotes_tables <- set_names(
+  map(
+    emotion_vars,
+    function(emotion) {
+      make_regression_table(
+        h2_models[[emotion]]$log_net_votes,
+        emotion_coef_map(emotion),
+        paste0("Table 2. ", emotion_labels[[emotion]], " moderation: net votes"),
+        paste0(
+          "The emotion score is standardized. Post controls are shown as coefficients. Category, month, and author fixed effects are reported as specification indicators."
+        ),
+        paste0("Table_2_", emotion, "_net_votes")
+      )
+    }
+  ),
+  emotion_vars
+)
+```
+
+## 5.1 Net votes {.panel-tabset}
+
+```{r}
+#| label: h2-net-votes
+#| results: asis
+
+for (emotion in emotion_vars) {
+  cat("### ", emotion_labels[[emotion]], "\n\n", sep = "")
+  cat(gt::as_raw_html(h2_netvotes_tables[[emotion]]))
+  cat("\n\n")
+}
+```
+
+```{r}
+#| label: h2-reblogs-build
+
+# Same pattern as the net-votes tables: build and save outside the asis block.
+h2_reblog_tables <- set_names(
+  map(
+    emotion_vars,
+    function(emotion) {
+      make_regression_table(
+        h2_models[[emotion]]$any_reblog,
+        emotion_coef_map(emotion),
+        paste0("Table 3. ", emotion_labels[[emotion]], " moderation: reblogs"),
+        paste0(
+          "The dependent variable equals one when a post received at least one reblog. The emotion score is standardized."
+        ),
+        paste0("Table_3_", emotion, "_any_reblog")
+      )
+    }
+  ),
+  emotion_vars
+)
+```
+
+## 5.2 Reblog probability {.panel-tabset}
+
+```{r}
+#| label: h2-reblogs
+#| results: asis
+
+for (emotion in emotion_vars) {
+  cat("### ", emotion_labels[[emotion]], "\n\n", sep = "")
+  cat(gt::as_raw_html(h2_reblog_tables[[emotion]]))
+  cat("\n\n")
+}
+```
+
+## 5.3 Visual summary of H2 net-vote interactions
+
+```{r}
+#| label: h2-plot-extract
+
+# Pull the three misleading-claim x emotion interaction coefficients from
+# the H2 net-votes models for one specification of the ladder. Returns one
+# row per emotion and claim level with the 95% confidence interval and a
+# significance flag; the plot below recodes and orders these columns.
+extract_interaction_plot_data <- function(spec_name) {
+  map_dfr(emotion_vars, function(emotion) {
+    model <- h2_models[[emotion]]$log_net_votes[[spec_name]]
+    emotion_z <- paste0(emotion, "_z")
+
+    broom::tidy(model, conf.int = TRUE, conf.level = 0.95) |>
+      filter(
+        str_detect(
+          term,
+          paste0("^misleading_n_f[123]:", emotion_z, "$")
+        )
+      ) |>
+      mutate(
+        n_claims = str_extract(term, "(?<=misleading_n_f)[123]"),
+        claim_level = case_when(
+          n_claims == "1" ~ "1 misleading claim",
+          n_claims == "2" ~ "2 misleading claims",
+          n_claims == "3" ~ "3 misleading claims"
+        ),
+        specification = spec_name,
+        emotion = unname(emotion_labels[[emotion]]),
+        significant = p.value < 0.05
+      ) |>
+      select(
+        specification, emotion, claim_level,
+        estimate, conf.low, conf.high, significant
+      )
+  })
+}
+
+h2_plot_data <- bind_rows(
+  extract_interaction_plot_data(
+    "(3) + category/month FE"
+  ),
+  extract_interaction_plot_data(
+    "(4) + author FE"
+  )
+) |>
+  mutate(
+    specification = recode(
+      specification,
+      "(3) + category/month FE" =
+        "(3) +Category and month FE",
+      "(4) + author FE" =
+        "(4) +Author FE"
+    ),
+
+    # Explicitly determine the left-to-right panel order.
+    specification = factor(
+      specification,
+      levels = c(
+        "(3) +Category and month FE",
+        "(4) +Author FE"
+      )
+    ),
+
+    claim_level = factor(
+      claim_level,
+      levels = c(
+        "1 misleading claim",
+        "2 misleading claims",
+        "3 misleading claims"
+      )
+    ),
+
+    emotion = factor(
+      emotion,
+      levels = unname(
+        emotion_labels[emotion_vars]
+      )
+    )
+  )
+```
+
+```{r}
+#| label: h2-netvotes-plot
+#| fig-width: 11
+#| fig-height: 5.2
+
+h2_plot_data <- h2_plot_data |>
+  mutate(
+    point_fill = if_else(
+      significant,
+      as.character(claim_level),
+      "Non-significant"
+    )
+  )
+
+dodge_position <- position_dodge(
+  width = 0.55,
+  preserve = "single"
+)
+
+p_h2_netvotes <- ggplot(
+  h2_plot_data,
+  aes(
+    x = emotion,
+    y = estimate,
+    colour = claim_level,
+    group = claim_level
+  )
+) +
+  geom_hline(
+    yintercept = 0,
+    linetype = 2,
+    colour = "grey55"
+  ) +
+
+  geom_errorbar(
+    aes(
+      ymin = conf.low,
+      ymax = conf.high
+    ),
+    position = dodge_position,
+    width = 0.18,
+    linewidth = 0.6
+  ) +
+
+  # All points are drawn in one layer so their positions remain aligned.
+  geom_point(
+    aes(fill = point_fill),
+    position = dodge_position,
+    shape = 21,
+    size = 3.2,
+    stroke = 1.1
+  ) +
+
+  facet_wrap(
+    ~ specification,
+    nrow = 1
+  ) +
+
+  scale_colour_manual(
+    values = interaction_cols,
+    name = NULL
+  ) +
+
+  scale_fill_manual(
+    values = c(
+      interaction_cols,
+      "Non-significant" = "white"
+    ),
+    guide = "none"
+  ) +
+
+  labs(
+    title = "Emotional-language interactions and net votes",
+    subtitle = paste0(
+      "Filled circles indicate statistically significant interactions; ",
+      "hollow circles indicate non-significant interactions"
+    ),
+    x = NULL,
+    y = "Interaction coefficient with 95% CI",
+    caption = paste0(
+      "Coefficients show how the emotional-language slope changes ",
+      "relative to posts containing true-side claims only."
+    )
+  ) +
+
+  theme_thesis(11) +
+
+  theme(
+    axis.text.x = element_text(
+      angle = 20,
+      hjust = 1
+    ),
+    legend.position = "bottom",
+    plot.caption = element_text(
+      hjust = 0,
+      colour = "grey35",
+      size = 9
+    )
+  )
+
+save_plot_both(
+  p_h2_netvotes,
+  "D7_H2_netvotes_interactions",
+  width = 11,
+  height = 5.2
+)
+
+p_h2_netvotes
+```
+
+# 6. Title robustness
+
+The same title-valid sample is used in all five columns. Title misinformation is a separate predictor and is not added to the body claim count.
+
+## 6.1 Net votes
+
+```{r}
+#| label: title-net-votes
+
+title_votes_models <- fit_title_ladder("log_net_votes", get_title_data("log_net_votes"))
+
+make_regression_table(
+  title_votes_models,
+  title_coef_map,
+  "Table R1A. Title robustness: net votes",
+  paste0(
+    "Restricted title-valid sample. Reference categories are zero misleading body claims and a non-misleading title."
+  ),
+  "Table_R1A_title_net_votes",
+  title_model = TRUE
+)
+```
+
+## 6.2 Reblog probability
+
+```{r}
+#| label: title-reblogs
+
+title_reblog_models <- fit_title_ladder("any_reblog", get_title_data("any_reblog"))
+
+make_regression_table(
+  title_reblog_models,
+  title_coef_map,
+  "Table R1B. Title robustness: reblog probability",
+  paste0(
+    "Restricted title-valid sample. Linear probability models. Reference categories are zero misleading body claims and a non-misleading title."
+  ),
+  "Table_R1B_title_any_reblog",
+  title_model = TRUE
+)
+```
+
+# 7. Payout robustness
+
+Payout is reported as a monetary-reward robustness outcome rather than as a primary dependent variable.
+
+## 7.1 H1 payout robustness
+
+```{r}
+#| label: payout-h1
+
+h1_payout_models <- fit_main_ladder("log_payout", "misleading_n_f", h1_payout_data)
+
+make_regression_table(
+  h1_payout_models,
+  h1_coef_map,
+  "Table R2. Misleading claims and payout",
+  paste0(
+    "The dependent variable is log(1 + payout). Payout is a robustness outcome because it is mechanically downstream of stake-weighted voting."
+  ),
+  "Table_R2_H1_payout"
+)
+```
+
+## 7.2 Title and payout
+
+```{r}
+#| label: payout-title
+
+title_payout_models <- fit_title_ladder("log_payout", get_title_data("log_payout"))
+
+make_regression_table(
+  title_payout_models,
+  title_coef_map,
+  "Table R3. Title robustness: payout",
+  paste0(
+    "Restricted title-valid sample. The dependent variable is log(1 + payout)."
+  ),
+  "Table_R3_title_payout",
+  title_model = TRUE
+)
+```
+
+# 8. Model fit for net votes, including pre-window author standing
+
+```{r}
+#| label: standing-r2
+#| fig-width: 8.5
+#| fig-height: 4.6
+
+standing_sample <- h1_votes_data |>
+  drop_na(all_of(standing_vars))
+
+r2_models <- list(
+  "(1) Body only" = fit_model("log_net_votes", "misleading_n_f", standing_sample),
+  "(2) + controls" = fit_model("log_net_votes", paste("misleading_n_f", controls, sep = " + "), standing_sample),
+  "(3) + category/month FE" = fit_model("log_net_votes", paste("misleading_n_f", controls, sep = " + "), standing_sample, fe_main),
+  "(4) + pre-window standing" = fit_model(
+    "log_net_votes",
+    paste("misleading_n_f", controls, paste(standing_vars, collapse = " + "), sep = " + "),
+    standing_sample,
+    fe_main
+  ),
+  "(5) + author FE" = fit_model("log_net_votes", paste("misleading_n_f", controls, sep = " + "), standing_sample, fe_author)
+)
+
+r2_plot_data <- tibble(
+  specification = names(r2_models),
+  r_squared = map_dbl(r2_models, ~ unname(fixest::fitstat(.x, "r2")[[1]]))
+)
+
+p_r2 <- ggplot(r2_plot_data, aes(x = fct_inorder(specification), y = r_squared, fill = specification)) +
+  geom_col(width = 0.72, show.legend = FALSE) +
+  geom_text(aes(label = sprintf("%.3f", r_squared)), vjust = -0.35, fontface = "bold", size = 3.4) +
+  scale_y_continuous(limits = c(0, max(r2_plot_data$r_squared) * 1.08), labels = number_format(accuracy = 0.01)) +
+  scale_fill_brewer(palette = "Blues") +
+  labs(
+    title = "Model fit for net votes",
+    subtitle = "The pre-window standing model adds cumulative author rewards, cumulative curation rewards, post count, and account age measured before 01-09-2024",
+    x = NULL,
+    y = "R-squared"
+  ) +
+  theme_thesis(11) +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+
+save_plot_both(p_r2, "D8_netvotes_model_fit_with_prewindow_standing", 8.5, 4.6)
+p_r2
+```
+
+# 9. Author popularity specifications
+
+This section implements the three specifications recommended by Prof. Eckert, together with a minimum-posts robustness check. The author popularity measure is the pre-window average author reward, defined as cumulative author rewards divided by the number of root posts, both measured strictly before 2024-09-01. Follower counts could not be reconstructed at feasible cost: follow relationships exist on Hive only as custom_json operations, and a feasibility probe on HiveSQL estimated roughly 147 million such operations before the window, so the reward-based measure serves as the popularity variable.
+
+## 9.1 Popularity groups
+
+Authors, not posts, are assigned to popularity groups so that every author's posts stay in one group. The median split defines the low and high popularity groups; the top 20% cut defines the restricted author fixed effects sample.
+
+```{r}
+#| label: eckert-popularity-setup
+
+popularity_var <- "log_pre_avg_reward"
+
+author_popularity <- model_data |>
+  group_by(author) |>
+  summarise(
+    pre_avg_reward = first(pre_avg_reward),
+    log_pre_avg_reward = first(log_pre_avg_reward),
+    n_posts_in_sample = n(),
+    .groups = "drop"
+  )
+
+pop_median <- median(author_popularity[[popularity_var]], na.rm = TRUE)
+
+pop_top20_cut <- quantile(
+  author_popularity[[popularity_var]],
+  probs = 0.80,
+  na.rm = TRUE
+)
+
+author_popularity <- author_popularity |>
+  mutate(
+    popularity_group = factor(
+      if_else(
+        .data[[popularity_var]] > pop_median,
+        "High popularity",
+        "Low popularity"
+      ),
+      levels = c("Low popularity", "High popularity")
+    ),
+    is_top20 = .data[[popularity_var]] >= pop_top20_cut
+  )
+
+popularity_cols <- author_popularity |>
+  select(author, popularity_group, is_top20, n_posts_in_sample)
+
+add_popularity <- function(df) {
+  df |>
+    left_join(popularity_cols, by = "author") |>
+    drop_na(popularity_group)
+}
+
+eckert_votes_data <- add_popularity(h1_votes_data)
+eckert_reblog_data <- add_popularity(h1_reblog_data)
+```
+
+```{r}
+#| label: eckert-group-sizes
+
+summarise_group <- function(data, label) {
+  data |>
+    summarise(
+      Group = label,
+      Authors = n_distinct(author),
+      Posts = n(),
+      `Posts per author` = round(n() / n_distinct(author), 1),
+      `Median popularity` = round(
+        median(pre_avg_reward, na.rm = TRUE),
+        1
+      )
+    )
+}
+
+group_summary <- bind_rows(
+  summarise_group(eckert_votes_data, "Full sample"),
+  summarise_group(
+    filter(eckert_votes_data, popularity_group == "Low popularity"),
+    "Low popularity (below median)"
+  ),
+  summarise_group(
+    filter(eckert_votes_data, popularity_group == "High popularity"),
+    "High popularity (above median)"
+  ),
+  summarise_group(
+    filter(eckert_votes_data, is_top20),
+    "Top 20% by popularity"
+  )
+)
+
+group_summary_gt <- group_summary |>
+  gt() |>
+  fmt_integer(columns = c(Authors, Posts)) |>
+  fmt_number(columns = `Median popularity`, decimals = 1) |>
+  tab_header(
+    title = "Table 4C. Sample composition of the popularity groups"
+  ) |>
+  tab_source_note(
+    md(
+      "Note. Popularity is the pre-window average author reward per pre-window root post, in vesting units. Groups are formed at the author level so that all posts by one author fall into one group."
+    )
+  )
+
+group_summary_gt
+save_gt_table(group_summary_gt, "Table_4C_popularity_group_sizes")
+```
+
+## 9.2 Estimation helpers
+
+```{r}
+#| label: eckert-helpers
+
+standing_terms <- paste(standing_vars, collapse = " + ")
+rhs_eckert_full <- paste(
+  "misleading_n_f", controls, standing_terms,
+  sep = " + "
+)
+rhs_eckert_fe <- paste("misleading_n_f", controls, sep = " + ")
+
+fit_eckert_models <- function(outcome, data) {
+  list(
+    "(1) Full model" = fit_model(
+      outcome, rhs_eckert_full, data, fe_main
+    ),
+    "(2a) Low popularity" = fit_model(
+      outcome, rhs_eckert_full,
+      filter(data, popularity_group == "Low popularity"), fe_main
+    ),
+    "(2b) High popularity" = fit_model(
+      outcome, rhs_eckert_full,
+      filter(data, popularity_group == "High popularity"), fe_main
+    ),
+    "(3) Top 20% + author FE" = fit_model(
+      outcome, rhs_eckert_fe,
+      filter(data, is_top20), fe_author
+    )
+  )
+}
+
+eckert_spec_rows <- function(model_names) {
+  values <- list(
+    "Post controls" = c("Yes", "Yes", "Yes", "Yes"),
+    "Pre-window author history" = c("Yes", "Yes", "Yes", "Absorbed"),
+    "Category fixed effects" = c("Yes", "Yes", "Yes", "Yes"),
+    "Month fixed effects" = c("Yes", "Yes", "Yes", "Yes"),
+    "Author fixed effects" = c("No", "No", "No", "Yes")
+  )
+  rows <- tibble(term = names(values))
+  for (i in seq_along(model_names)) {
+    rows[[model_names[i]]] <- unname(map_chr(values, ~ .x[[i]]))
+  }
+  rows
+}
+
+eckert_coef_map <- c(
+  "misleading_n_f1" = "1 misleading claim",
+  "misleading_n_f2" = "2 misleading claims",
+  "misleading_n_f3" = "3 misleading claims",
+  control_coef_map,
+  standing_labels
+)
+
+eckert_note <- function(dv_sentence) {
+  paste0(
+    dv_sentence,
+    " Column 1 estimates the full model with pre-window author history and without author fixed effects. ",
+    "Columns 2a and 2b split authors at the median of pre-window average author reward. ",
+    "Column 3 restricts the sample to the top 20% of authors by the same measure and adds author fixed effects, which absorb the author-level history variables."
+  )
+}
+```
+
+## 9.3 Net votes
+
+```{r}
+#| label: eckert-net-votes
+
+eckert_votes_models <- fit_eckert_models(
+  "log_net_votes",
+  eckert_votes_data
+)
+
+make_regression_table(
+  eckert_votes_models,
+  eckert_coef_map,
+  "Table 4A. Author popularity specifications: net votes",
+  eckert_note(
+    "The dependent variable is log(1 + max(net votes, 0))."
+  ),
+  "Table_4A_popularity_net_votes",
+  spec_rows = eckert_spec_rows(names(eckert_votes_models))
+)
+```
+
+## 9.4 Reblog probability
+
+```{r}
+#| label: eckert-reblogs
+
+eckert_reblog_models <- fit_eckert_models(
+  "any_reblog",
+  eckert_reblog_data
+)
+
+make_regression_table(
+  eckert_reblog_models,
+  eckert_coef_map,
+  "Table 4B. Author popularity specifications: reblog probability",
+  eckert_note(
+    "The dependent variable equals one when a post received at least one reblog; the models are linear probability models."
+  ),
+  "Table_4B_popularity_any_reblog",
+  spec_rows = eckert_spec_rows(names(eckert_reblog_models))
+)
+```
+
+## 9.5 Minimum-posts robustness
+
+Author fixed effects are re-estimated after excluding authors with fewer than five posts in the analysis sample. Single-post authors contribute no within-author variation, so this check verifies that the author fixed effects estimates are not shaped by sparsely observed authors.
+
+```{r}
+#| label: eckert-min-posts
+
+min_posts_threshold <- 5
+
+minposts_retained <- eckert_votes_data |>
+  filter(n_posts_in_sample >= min_posts_threshold)
+
+cat(
+  "Minimum-posts check retains",
+  n_distinct(minposts_retained$author), "of",
+  n_distinct(eckert_votes_data$author), "authors and",
+  nrow(minposts_retained), "of",
+  nrow(eckert_votes_data), "posts.\n"
+)
+
+fit_minposts_models <- function(outcome, data) {
+  restricted <- filter(
+    data,
+    n_posts_in_sample >= min_posts_threshold
+  )
+  list(
+    "(1) All authors" = fit_model(
+      outcome, rhs_eckert_fe, data, fe_author
+    ),
+    "(2) Authors with 5+ posts" = fit_model(
+      outcome, rhs_eckert_fe, restricted, fe_author
+    )
+  )
+}
+
+minposts_spec_rows <- function(model_names) {
+  values <- list(
+    "Post controls" = c("Yes", "Yes"),
+    "Category fixed effects" = c("Yes", "Yes"),
+    "Month fixed effects" = c("Yes", "Yes"),
+    "Author fixed effects" = c("Yes", "Yes"),
+    "Minimum posts per author" = c(
+      "1",
+      as.character(min_posts_threshold)
+    )
+  )
+  rows <- tibble(term = names(values))
+  for (i in seq_along(model_names)) {
+    rows[[model_names[i]]] <- unname(map_chr(values, ~ .x[[i]]))
+  }
+  rows
+}
+
+minposts_votes_models <- fit_minposts_models(
+  "log_net_votes",
+  eckert_votes_data
+)
+
+make_regression_table(
+  minposts_votes_models,
+  h1_coef_map,
+  "Table 5A. Minimum-posts robustness: net votes",
+  paste0(
+    "The dependent variable is log(1 + max(net votes, 0)). Column 2 excludes authors with fewer than five posts in the analysis sample before re-estimating the author fixed effects specification."
+  ),
+  "Table_5A_minposts_net_votes",
+  spec_rows = minposts_spec_rows(names(minposts_votes_models))
+)
+```
+
+```{r}
+#| label: eckert-min-posts-reblogs
+
+minposts_reblog_models <- fit_minposts_models(
+  "any_reblog",
+  eckert_reblog_data
+)
+
+make_regression_table(
+  minposts_reblog_models,
+  h1_coef_map,
+  "Table 5B. Minimum-posts robustness: reblog probability",
+  paste0(
+    "The dependent variable equals one when a post received at least one reblog. Column 2 excludes authors with fewer than five posts in the analysis sample before re-estimating the author fixed effects specification."
+  ),
+  "Table_5B_minposts_any_reblog",
+  spec_rows = minposts_spec_rows(names(minposts_reblog_models))
+)
+```
+
+## 9.6 Exploratory: emotional language and any misleading claim by author popularity
+
+This appendix reports an exploratory check that is not part of the confirmatory analysis. The categorical claim-count specification leaves too few posts in the two- and three-claim cells to support interactions within popularity subgroups, so the accuracy measure is collapsed to a binary indicator of whether a post contains at least one misleading claim. Each cell reports the interaction between that indicator and one standardized emotion score. Results are exploratory and should be read with the number of simultaneous tests in mind.
+
+```{r}
+#| label: appendix-binary-emotion-popularity
+
+# Exploratory only: binary accuracy contrast interacted with each emotion,
+# estimated separately for the full sample and the two popularity groups.
+appendix_fit <- function(outcome, emotion, data) {
+  emotion_z <- paste0(emotion, "_z")
+  fit_data <- data |> drop_na(all_of(emotion_z))
+  
+  if (nrow(fit_data) < 100) {
+    return(NULL)
+  }
+  
+  rhs <- paste(
+    paste0("any_misleading_claim * ", emotion_z),
+    controls,
+    standing_terms,
+    sep = " + "
+  )
+  
+  tryCatch(
+    fit_model(outcome, rhs, fit_data, fe_author),
+    error = function(e) NULL
+  )
+}
+
+appendix_extract <- function(model, emotion) {
+  if (is.null(model)) {
+    return(tibble(estimate = NA_real_, std.error = NA_real_,
+                  p.value = NA_real_, n = NA_integer_))
+  }
+  term_name <- paste0("any_misleading_claim:", emotion, "_z")
+  tidied <- broom::tidy(model) |> filter(term == term_name)
+  if (nrow(tidied) == 0) {
+    return(tibble(estimate = NA_real_, std.error = NA_real_,
+                  p.value = NA_real_, n = NA_integer_))
+  }
+  tidied |>
+    transmute(estimate, std.error, p.value, n = as.integer(nobs(model)))
+}
+
+appendix_groups <- list(
+  all = function(df) df,
+  low = function(df) filter(df, popularity_group == "Low popularity"),
+  high = function(df) filter(df, popularity_group == "High popularity")
+)
+
+appendix_results <- expand_grid(
+  emotion = emotion_vars,
+  outcome = c("log_net_votes", "any_reblog"),
+  group = names(appendix_groups)
+) |>
+  pmap_dfr(function(emotion, outcome, group) {
+    data <- if (outcome == "log_net_votes") {
+      eckert_votes_data
+    } else {
+      eckert_reblog_data
+    }
+    model <- appendix_fit(outcome, emotion, appendix_groups[[group]](data))
+    bind_cols(
+      tibble(emotion = emotion, outcome = outcome, group = group),
+      appendix_extract(model, emotion)
+    )
+  })
+
+star_of <- function(p) {
+  case_when(
+    is.na(p) ~ "",
+    p < 0.001 ~ "***",
+    p < 0.01 ~ "**",
+    p < 0.05 ~ "*",
+    p < 0.10 ~ "+",
+    TRUE ~ ""
+  )
+}
+
+appendix_table_data <- appendix_results |>
+  mutate(
+    cell = if_else(
+      is.na(estimate),
+      "not estimated",
+      paste0(
+        sprintf("%.3f", estimate), star_of(p.value),
+        " (", sprintf("%.3f", std.error), ")"
+      )
+    ),
+    emotion_label = unname(unlist(emotion_labels[emotion])),
+    column_key = paste0(
+      if_else(outcome == "log_net_votes", "votes", "reblog"), "_", group
+    )
+  ) |>
+  select(emotion_label, column_key, cell) |>
+  pivot_wider(names_from = column_key, values_from = cell) |>
+  select(
+    emotion_label,
+    votes_all, votes_low, votes_high,
+    reblog_all, reblog_low, reblog_high
+  )
+
+n_tests <- sum(!is.na(appendix_results$p.value))
+n_marginal <- sum(appendix_results$p.value < 0.10, na.rm = TRUE)
+n_significant <- sum(appendix_results$p.value < 0.05, na.rm = TRUE)
+
+appendix_gt <- appendix_table_data |>
+  gt() |>
+  cols_label(
+    emotion_label = "Emotion",
+    votes_all = "All authors",
+    votes_low = "Low popularity",
+    votes_high = "High popularity",
+    reblog_all = "All authors",
+    reblog_low = "Low popularity",
+    reblog_high = "High popularity"
+  ) |>
+  tab_spanner(
+    label = "Net votes",
+    columns = c(votes_all, votes_low, votes_high)
+  ) |>
+  tab_spanner(
+    label = "Reblog probability",
+    columns = c(reblog_all, reblog_low, reblog_high)
+  ) |>
+  tab_header(
+    title = paste0(
+      "Table A1. Exploratory interactions between emotional language and ",
+      "any misleading claim, by author popularity"
+    )
+  ) |>
+  tab_source_note(
+    md(
+      paste0(
+        "Note. Each cell reports the coefficient on the interaction between ",
+        "an indicator for at least one misleading claim and one standardized ",
+        "emotion score, with HC1 robust standard errors in parentheses. ",
+        "Every model includes post controls, pre-window author history, and ",
+        "category and month fixed effects. Popularity groups split authors at ",
+        "the median of pre-window average author reward. ",
+        "+ p < 0.10; * p < 0.05; ** p < 0.01; *** p < 0.001. ",
+        "These estimates are exploratory: ", n_tests, " interactions are ",
+        "estimated simultaneously, so roughly ",
+        sprintf("%.1f", n_tests * 0.05),
+        " results significant at the five percent level would be expected by ",
+        "chance alone."
+      )
+    )
+  )
+
+appendix_gt
+save_gt_table(appendix_gt, "Table_A1_exploratory_emotion_popularity")
+
+cat(
+  "Exploratory interactions estimated:", n_tests,
+  "| significant at p < 0.05:", n_significant,
+  "| marginal at p < 0.10:", n_marginal, "\n"
+)
+```
+
+# 10. Robustness: emotional language measured by lexicon
+
+The moderation hypothesis is re-tested with an alternative operationalization of emotional language. The main analysis measures emotional language with a transformer classifier that reads context and returns probabilities for six discrete emotions. This section instead uses the NRC-VAD Lexicon (Mohammad, 2018), which assigns human-rated valence, arousal, and dominance scores to individual words and averages them across the words of each post. The two approaches rest on different assumptions and fail in different ways, so agreement between them indicates that the results do not depend on a single measurement strategy. The lexicon involves no model, which also speaks to concerns about relying on automated classification.
+
+Each dimension is standardized and entered in a separate model, following the same specification ladder used for the discrete emotions.
+
+## 10.1 Measurement properties
+
+```{r}
+#| label: vad-descriptives
+
+vad_summary <- model_data |>
+  filter(analysis_sample_body %in% TRUE) |>
+  summarise(
+    across(
+      all_of(vad_vars),
+      list(
+        mean = ~ mean(.x, na.rm = TRUE),
+        sd = ~ sd(.x, na.rm = TRUE),
+        min = ~ min(.x, na.rm = TRUE),
+        max = ~ max(.x, na.rm = TRUE)
+      ),
+      .names = "{.col}__{.fn}"
+    ),
+    n_scored = sum(!is.na(valence)),
+    n_sparse = sum(vad_n_matched < 10, na.rm = TRUE)
+  ) |>
+  pivot_longer(
+    cols = contains("__"),
+    names_to = c("dimension", "statistic"),
+    names_sep = "__"
+  ) |>
+  pivot_wider(names_from = statistic, values_from = value) |>
+  mutate(dimension = unname(vad_labels[dimension]))
+
+vad_summary_gt <- vad_summary |>
+  select(dimension, mean, sd, min, max, n_scored, n_sparse) |>
+  gt() |>
+  cols_label(
+    dimension = "Dimension",
+    mean = "Mean",
+    sd = "SD",
+    min = "Min",
+    max = "Max",
+    n_scored = "Posts scored",
+    n_sparse = "Posts with < 10 matched words"
+  ) |>
+  fmt_number(columns = c(mean, sd, min, max), decimals = 3) |>
+  fmt_integer(columns = c(n_scored, n_sparse)) |>
+  tab_header(title = "Table 6A. NRC-VAD measurement properties") |>
+  tab_source_note(
+    md(
+      "Note. Scores range from 0 to 1 and are averaged over the words of each post that appear in the lexicon. Averaging across many words compresses the scores toward the middle of the scale, so all models use standardized values. Posts resting on fewer than ten matched words are examined separately in Table 6D."
+    )
+  )
+
+vad_summary_gt
+save_gt_table(vad_summary_gt, "Table_6A_vad_descriptives")
+```
+
+```{r}
+#| label: vad-convergent-validity
+
+vad_corr <- model_data |>
+  filter(analysis_sample_body %in% TRUE) |>
+  select(all_of(c(vad_vars, emotion_vars))) |>
+  drop_na() |>
+  cor()
+
+vad_corr_table <- as_tibble(
+  vad_corr[emotion_vars, vad_vars, drop = FALSE],
+  rownames = "emotion"
+) |>
+  mutate(emotion = unname(emotion_labels[emotion]))
+
+vad_corr_gt <- vad_corr_table |>
+  gt() |>
+  cols_label(
+    emotion = "Emotion",
+    valence = "Valence",
+    arousal = "Arousal",
+    dominance = "Dominance"
+  ) |>
+  fmt_number(columns = all_of(vad_vars), decimals = 3) |>
+  tab_header(
+    title = "Table 6B. Correlations between the lexicon dimensions and the classifier emotions"
+  ) |>
+  tab_source_note(
+    md(
+      "Note. Valence is expected to be negatively associated with the negative emotions and positively associated with joy. Dominance has no counterpart among the discrete emotions, so it represents a dimension the main measure does not capture."
+    )
+  )
+
+vad_corr_gt
+save_gt_table(vad_corr_gt, "Table_6B_vad_correlations")
+```
+
+## 10.2 Moderation models
+
+```{r}
+#| label: estimate-vad
+
+get_vad_data <- function(outcome, dimension) {
+  model_data |>
+    drop_na(all_of(c(outcome, h1_required, paste0(dimension, "_z"))))
+}
+
+fit_vad_ladder <- function(outcome, dimension) {
+  fit_main_ladder(
+    outcome,
+    paste0("misleading_n_f * ", dimension, "_z"),
+    get_vad_data(outcome, dimension)
+  )
+}
+
+vad_models <- set_names(
+  map(
+    vad_vars,
+    function(dimension) {
+      list(
+        log_net_votes = fit_vad_ladder("log_net_votes", dimension),
+        any_reblog = fit_vad_ladder("any_reblog", dimension)
+      )
+    }
+  ),
+  vad_vars
+)
+
+vad_coef_map <- function(dimension) {
+  dimension_z <- paste0(dimension, "_z")
+  label <- unname(vad_labels[[dimension]])
+  c(
+    "misleading_n_f1" = "1 misleading claim",
+    "misleading_n_f2" = "2 misleading claims",
+    "misleading_n_f3" = "3 misleading claims",
+    setNames(paste0(label, " (z)"), dimension_z),
+    setNames(
+      paste0("1 misleading claim x ", label),
+      paste0("misleading_n_f1:", dimension_z)
+    ),
+    setNames(
+      paste0("2 misleading claims x ", label),
+      paste0("misleading_n_f2:", dimension_z)
+    ),
+    setNames(
+      paste0("3 misleading claims x ", label),
+      paste0("misleading_n_f3:", dimension_z)
+    ),
+    control_coef_map
+  )
+}
+```
+
+```{r}
+#| label: vad-tables-build
+
+vad_tables <- set_names(
+  map(
+    vad_vars,
+    function(dimension) {
+      list(
+        log_net_votes = make_regression_table(
+          vad_models[[dimension]]$log_net_votes,
+          vad_coef_map(dimension),
+          paste0(
+            "Table 6C. ", unname(vad_labels[[dimension]]),
+            " moderation: net votes"
+          ),
+          "The lexicon score is standardized. Post controls are shown as coefficients. Category, month, and author fixed effects are reported as specification indicators.",
+          paste0("Table_6C_", dimension, "_net_votes")
+        ),
+        any_reblog = make_regression_table(
+          vad_models[[dimension]]$any_reblog,
+          vad_coef_map(dimension),
+          paste0(
+            "Table 6C. ", unname(vad_labels[[dimension]]),
+            " moderation: reblog probability"
+          ),
+          "The lexicon score is standardized. The dependent variable equals one when a post received at least one reblog; the models are linear probability models.",
+          paste0("Table_6C_", dimension, "_any_reblog")
+        )
+      )
+    }
+  ),
+  vad_vars
+)
+```
+
+::: panel-tabset
+```{r}
+#| label: vad-tables-show
+#| results: asis
+
+for (dimension in vad_vars) {
+  cat("\n\n## ", unname(vad_labels[[dimension]]), "\n\n")
+  cat("\n\n### Net votes\n\n")
+  print(vad_tables[[dimension]]$log_net_votes)
+  cat("\n\n### Reblog probability\n\n")
+  print(vad_tables[[dimension]]$any_reblog)
+}
+```
+:::
+
+## 10.3 Sensitivity to sparse lexicon matching
+
+Posts containing few words that appear in the lexicon produce averages estimated from very little information, and these posts also tend to be short. The author fixed effects specification is re-estimated after excluding posts with fewer than ten matched words.
+
+```{r}
+#| label: vad-sparse-sensitivity
+
+vad_sparse_threshold <- 10
+
+vad_sparse_models <- set_names(
+  map(
+    vad_vars,
+    function(dimension) {
+      full_data <- get_vad_data("log_net_votes", dimension)
+      restricted <- filter(full_data, vad_n_matched >= vad_sparse_threshold)
+      focal <- paste0("misleading_n_f * ", dimension, "_z")
+      list(
+        "(1) All posts" = fit_model(
+          "log_net_votes", paste(focal, controls, sep = " + "),
+          full_data, fe_author
+        ),
+        "(2) 10+ matched words" = fit_model(
+          "log_net_votes", paste(focal, controls, sep = " + "),
+          restricted, fe_author
+        )
+      )
+    }
+  ),
+  vad_vars
+)
+
+vad_sparse_rows <- function(model_names) {
+  values <- list(
+    "Post controls" = c("Yes", "Yes"),
+    "Category fixed effects" = c("Yes", "Yes"),
+    "Month fixed effects" = c("Yes", "Yes"),
+    "Author fixed effects" = c("Yes", "Yes"),
+    "Minimum matched words" = c("1", as.character(vad_sparse_threshold))
+  )
+  rows <- tibble(term = names(values))
+  for (i in seq_along(model_names)) {
+    rows[[model_names[i]]] <- unname(map_chr(values, ~ .x[[i]]))
+  }
+  rows
+}
+
+vad_sparse_tables <- set_names(
+  map(
+    vad_vars,
+    function(dimension) {
+      make_regression_table(
+        vad_sparse_models[[dimension]],
+        vad_coef_map(dimension),
+        paste0(
+          "Table 6D. ", unname(vad_labels[[dimension]]),
+          " moderation excluding sparsely matched posts: net votes"
+        ),
+        paste0(
+          "The dependent variable is log(1 + max(net votes, 0)). Column 2 excludes posts with fewer than ",
+          vad_sparse_threshold,
+          " words matched to the lexicon before re-estimating the author fixed effects specification."
+        ),
+        paste0("Table_6D_", dimension, "_sparse_sensitivity"),
+        spec_rows = vad_sparse_rows(names(vad_sparse_models[[dimension]]))
+      )
+    }
+  ),
+  vad_vars
+)
+
+cat(
+  "Sparse-match sensitivity: posts retained",
+  nrow(filter(get_vad_data("log_net_votes", "valence"),
+              vad_n_matched >= vad_sparse_threshold)),
+  "of",
+  nrow(get_vad_data("log_net_votes", "valence")), "\n"
+)
+
+vad_sparse_tables[["valence"]]
+```
+# 11. Emotional dynamics: within-post movement in emotional language
+
+The moderation analysis so far measures emotional language as a level, that is, how much of a given emotion a post contains on average. This section adds a second property of the same construct: how much the emotion moves from one sentence to the next. Berger et al. (2021) argue that content is more engaging when its emotional trajectory shifts rather than remaining flat, and that this movement is distinct from the average emotional level. The measure is volatility, defined as the standard deviation of the differences between adjacent sentences within a post.
+
+The measures are built in two steps outside this file. Each post is split into sentences, every sentence is scored with the same classifier used for the post-level measures, and the sentence scores are then aggregated per post. Fragments that carry formatting rather than emotional language, such as donation links, social media handles, and affiliate lists, are removed before aggregation, because segmenting them produces neutral fragments that introduce movement which reflects layout rather than language.
+
+Each emotion is estimated in a separate model, following the same four-model ladder used for H1 and H2. Volatility and the sentence-level mean both interact with the misleading-claim count, so the volatility interaction is identified net of any interaction operating through the emotional level.
+
+## 11.1 Building the dynamics variables
+
+```{r}
+#| label: dynamics-load
+
+dynamics_path <- file.path(
+  base_dir,
+  "9. Sentence Emotion Scoring",
+  "hive_emotion_dynamics.parquet"
+)
+
+if (!file.exists(dynamics_path)) {
+  stop("Emotional dynamics file not found: ", dynamics_path)
+}
+
+dynamics_volatility_vars <- paste0(emotion_vars, "_volatility")
+dynamics_dispersion_vars <- paste0(emotion_vars, "_sd")
+dynamics_mean_vars <- paste0(emotion_vars, "_mean")
+
+dynamics_raw <- read_parquet(dynamics_path) |>
+  as_tibble() |>
+  mutate(doc_id = trimws(as.character(doc_id))) |>
+  select(
+    doc_id,
+    n_sentences_total,
+    n_sentences_kept,
+    all_of(c(
+      dynamics_volatility_vars,
+      dynamics_dispersion_vars,
+      dynamics_mean_vars
+    ))
+  )
+
+if (anyDuplicated(dynamics_raw$doc_id) > 0) {
+  stop("The emotional dynamics file contains duplicate doc_id values.")
+}
+
+dynamics_data <- model_data |>
+  mutate(doc_id = trimws(as.character(doc_id))) |>
+  left_join(dynamics_raw, by = "doc_id") |>
+  mutate(
+    across(
+      all_of(c(dynamics_volatility_vars, dynamics_mean_vars)),
+      ~ as.numeric(.x)
+    ),
+    across(
+      all_of(c(dynamics_volatility_vars, dynamics_mean_vars)),
+      ~ z_score(.x),
+      .names = "{.col}_z"
+    ),
+    log_n_sentences = log1p(pmax(as.numeric(n_sentences_kept), 0))
+  )
+```
+
+Volatility requires at least three usable sentences, since two adjacent differences are the minimum for a sample standard deviation. Posts falling below that threshold drop from these models only and remain in every other analysis in this file.
+
+```{r}
+#| label: dynamics-coverage
+
+dynamics_coverage <- tibble(
+  Metric = c(
+    "Posts in the body-only main sample",
+    "Posts matched to a dynamics record",
+    "Posts with volatility defined",
+    "Posts without a dynamics record",
+    "Posts with fewer than three usable sentences",
+    "Median usable sentences per post"
+  ),
+  Value = c(
+    nrow(dynamics_data),
+    sum(!is.na(dynamics_data$n_sentences_total)),
+    sum(!is.na(dynamics_data$anger_volatility)),
+    sum(is.na(dynamics_data$n_sentences_total)),
+    sum(
+      !is.na(dynamics_data$n_sentences_total) &
+        is.na(dynamics_data$anger_volatility)
+    ),
+    median(dynamics_data$n_sentences_kept, na.rm = TRUE)
+  )
+)
+
+dynamics_coverage_gt <- dynamics_coverage |>
+  gt() |>
+  fmt_integer(columns = Value) |>
+  tab_header(title = "Table 7A. Coverage of the emotional dynamics measures") |>
+  tab_source_note(
+    md(
+      "Note. Volatility is undefined for posts with fewer than three usable sentences. These posts are excluded from the models in this section and are retained everywhere else in the analysis."
+    )
+  )
+
+dynamics_coverage_gt
+save_gt_table(dynamics_coverage_gt, "Table_7A_dynamics_coverage")
+```
+
+## 11.2 Measurement properties
+
+Volatility and dispersion are both computed at the aggregation stage, but only volatility enters the models. The table below reports why. Dispersion is the standard deviation across sentences irrespective of their order, whereas volatility is the standard deviation of the differences between adjacent sentences. When sentence scores are close to independent of one another, the two are related by a fixed factor of the square root of two, and the implied correlation between adjacent sentences follows directly from their ratio. Berger et al. (2021) enter both measures together, but report that they could not do so in one of their studies because the two were too closely related.
+
+```{r}
+#| label: dynamics-properties
+
+dynamics_properties <- map_dfr(emotion_vars, function(emotion) {
+  volatility <- dynamics_data[[paste0(emotion, "_volatility")]]
+  dispersion <- dynamics_data[[paste0(emotion, "_sd")]]
+  level <- dynamics_data[[paste0(emotion, "_mean")]]
+
+  ratio <- mean(volatility, na.rm = TRUE) / mean(dispersion, na.rm = TRUE)
+
+  tibble(
+    emotion = unname(emotion_labels[[emotion]]),
+    volatility_mean = mean(volatility, na.rm = TRUE),
+    volatility_sd = sd(volatility, na.rm = TRUE),
+    level_mean = mean(level, na.rm = TRUE),
+    level_sd = sd(level, na.rm = TRUE),
+    r_volatility_dispersion = cor(volatility, dispersion, use = "complete.obs"),
+    r_volatility_level = cor(volatility, level, use = "complete.obs"),
+    implied_adjacent_r = 1 - (ratio^2) / 2
+  )
+})
+
+dynamics_properties_gt <- dynamics_properties |>
+  gt() |>
+  cols_label(
+    emotion = "Emotion",
+    volatility_mean = "Volatility mean",
+    volatility_sd = "Volatility SD",
+    level_mean = "Sentence mean",
+    level_sd = "Sentence mean SD",
+    r_volatility_dispersion = "r volatility, dispersion",
+    r_volatility_level = "r volatility, mean",
+    implied_adjacent_r = "Implied adjacent-sentence r"
+  ) |>
+  fmt_number(columns = -emotion, decimals = 3) |>
+  tab_header(title = "Table 7B. Properties of the emotional dynamics measures") |>
+  tab_source_note(
+    md(
+      "Note. Dispersion is the standard deviation of the sentence scores and volatility is the standard deviation of the differences between adjacent sentences. The implied adjacent-sentence correlation is recovered from the ratio of the two, since volatility equals dispersion multiplied by the square root of two times one minus that correlation. Values close to zero indicate that emotional language is distributed across sentences with little ordering, so volatility carries almost the same information as dispersion. Dispersion is therefore reported here but excluded from the models, and volatility is retained as the theoretically motivated measure."
+    )
+  )
+
+dynamics_properties_gt
+save_gt_table(dynamics_properties_gt, "Table_7B_dynamics_properties")
+```
+
+## 11.3 Model specification
+
+Each emotion is estimated in its own model. Volatility and the sentence-level mean are standardized and both interact with the misleading-claim count, which gives eleven focal coefficients per model. Dispersion is excluded for the reason set out in Table 7B.
+
+```{r}
+#| label: estimate-dynamics
+
+get_dynamics_data <- function(outcome, emotion) {
+  dynamics_data |>
+    drop_na(all_of(c(
+      outcome,
+      h1_required,
+      paste0(emotion, "_volatility_z"),
+      paste0(emotion, "_mean_z")
+    )))
+}
+
+fit_dynamics_ladder <- function(outcome, emotion) {
+  focal <- paste0(
+    "misleading_n_f * (",
+    emotion, "_volatility_z + ", emotion, "_mean_z",
+    ")"
+  )
+  fit_main_ladder(outcome, focal, get_dynamics_data(outcome, emotion))
+}
+
+dynamics_models <- set_names(
+  map(
+    emotion_vars,
+    function(emotion) {
+      list(
+        log_net_votes = fit_dynamics_ladder("log_net_votes", emotion),
+        any_reblog = fit_dynamics_ladder("any_reblog", emotion)
+      )
+    }
+  ),
+  emotion_vars
+)
+
+dynamics_coef_map <- function(emotion) {
+  volatility_z <- paste0(emotion, "_volatility_z")
+  mean_z <- paste0(emotion, "_mean_z")
+  label <- unname(emotion_labels[[emotion]])
+
+  c(
+    "misleading_n_f1" = "1 misleading claim",
+    "misleading_n_f2" = "2 misleading claims",
+    "misleading_n_f3" = "3 misleading claims",
+    setNames(paste0(label, " volatility (z)"), volatility_z),
+    setNames(paste0(label, " sentence mean (z)"), mean_z),
+    setNames(
+      paste0("1 misleading claim x ", label, " volatility"),
+      paste0("misleading_n_f1:", volatility_z)
+    ),
+    setNames(
+      paste0("2 misleading claims x ", label, " volatility"),
+      paste0("misleading_n_f2:", volatility_z)
+    ),
+    setNames(
+      paste0("3 misleading claims x ", label, " volatility"),
+      paste0("misleading_n_f3:", volatility_z)
+    ),
+    setNames(
+      paste0("1 misleading claim x ", label, " sentence mean"),
+      paste0("misleading_n_f1:", mean_z)
+    ),
+    setNames(
+      paste0("2 misleading claims x ", label, " sentence mean"),
+      paste0("misleading_n_f2:", mean_z)
+    ),
+    setNames(
+      paste0("3 misleading claims x ", label, " sentence mean"),
+      paste0("misleading_n_f3:", mean_z)
+    ),
+    control_coef_map
+  )
+}
+```
+
+```{r}
+#| label: dynamics-tables-build
+
+# Tables are built and saved here, outside the results = "asis" blocks below,
+# so that any webshot2 progress text stays contained in an ordinary chunk.
+dynamics_tables <- set_names(
+  map(
+    emotion_vars,
+    function(emotion) {
+      list(
+        log_net_votes = make_regression_table(
+          dynamics_models[[emotion]]$log_net_votes,
+          dynamics_coef_map(emotion),
+          paste0(
+            "Table 7C. ", emotion_labels[[emotion]],
+            " dynamics moderation: net votes"
+          ),
+          "Volatility is the standard deviation of the differences between adjacent sentences and the sentence mean is the average across sentences of the same post. Both are standardized and both interact with the misleading-claim count, so the volatility interaction is identified net of any interaction operating through the emotional level.",
+          paste0("Table_7C_", emotion, "_dynamics_net_votes")
+        ),
+        any_reblog = make_regression_table(
+          dynamics_models[[emotion]]$any_reblog,
+          dynamics_coef_map(emotion),
+          paste0(
+            "Table 7D. ", emotion_labels[[emotion]],
+            " dynamics moderation: reblog probability"
+          ),
+          "The dependent variable equals one when a post received at least one reblog; the models are linear probability models. Volatility and the sentence mean are standardized.",
+          paste0("Table_7D_", emotion, "_dynamics_any_reblog")
+        )
+      )
+    }
+  ),
+  emotion_vars
+)
+```
+
+## 11.4 Net votes {.panel-tabset}
+
+```{r}
+#| label: dynamics-netvotes-show
+#| results: asis
+
+for (emotion in emotion_vars) {
+  cat("### ", unname(emotion_labels[[emotion]]), "\n\n", sep = "")
+  cat(gt::as_raw_html(dynamics_tables[[emotion]]$log_net_votes))
+  cat("\n\n")
+}
+```
+
+## 11.5 Reblog probability {.panel-tabset}
+
+```{r}
+#| label: dynamics-reblogs-show
+#| results: asis
+
+for (emotion in emotion_vars) {
+  cat("### ", unname(emotion_labels[[emotion]]), "\n\n", sep = "")
+  cat(gt::as_raw_html(dynamics_tables[[emotion]]$any_reblog))
+  cat("\n\n")
+}
+```
+
+## 11.6 Visual summary of the volatility interactions
+
+```{r}
+#| label: dynamics-plot-extract
+
+# Pull the three misleading-claim x volatility interaction coefficients from
+# the net-votes models for one specification of the ladder. The sentence-mean
+# interactions remain in the models and are reported in the tables above; the
+# figure isolates the volatility terms, which are the focal ones here.
+extract_dynamics_plot_data <- function(spec_name) {
+  map_dfr(emotion_vars, function(emotion) {
+    model <- dynamics_models[[emotion]]$log_net_votes[[spec_name]]
+    volatility_z <- paste0(emotion, "_volatility_z")
+
+    broom::tidy(model, conf.int = TRUE, conf.level = 0.95) |>
+      filter(
+        str_detect(term, paste0("^misleading_n_f[123]:", volatility_z, "$"))
+      ) |>
+      mutate(
+        n_claims = str_extract(term, "(?<=misleading_n_f)[123]"),
+        claim_level = case_when(
+          n_claims == "1" ~ "1 misleading claim",
+          n_claims == "2" ~ "2 misleading claims",
+          n_claims == "3" ~ "3 misleading claims"
+        ),
+        specification = spec_name,
+        emotion = unname(emotion_labels[[emotion]]),
+        significant = p.value < 0.05
+      ) |>
+      select(
+        specification, emotion, claim_level,
+        estimate, conf.low, conf.high, significant
+      )
+  })
+}
+
+dynamics_plot_data <- bind_rows(
+  extract_dynamics_plot_data("(3) + category/month FE"),
+  extract_dynamics_plot_data("(4) + author FE")
+) |>
+  mutate(
+    specification = recode(
+      specification,
+      "(3) + category/month FE" = "(3) +Category and month FE",
+      "(4) + author FE" = "(4) +Author FE"
+    ),
+    specification = factor(
+      specification,
+      levels = c("(3) +Category and month FE", "(4) +Author FE")
+    ),
+    claim_level = factor(
+      claim_level,
+      levels = c(
+        "1 misleading claim",
+        "2 misleading claims",
+        "3 misleading claims"
+      )
+    ),
+    emotion = factor(
+      emotion,
+      levels = unname(emotion_labels[emotion_vars])
+    ),
+    point_fill = if_else(
+      significant,
+      as.character(claim_level),
+      "Non-significant"
+    )
+  )
+```
+
+```{r}
+#| label: dynamics-plot
+#| fig-width: 11
+#| fig-height: 5.2
+
+dodge_position_dynamics <- position_dodge(width = 0.55, preserve = "single")
+
+p_dynamics <- ggplot(
+  dynamics_plot_data,
+  aes(x = emotion, y = estimate, colour = claim_level, group = claim_level)
+) +
+  geom_hline(yintercept = 0, linetype = 2, colour = "grey55") +
+  geom_errorbar(
+    aes(ymin = conf.low, ymax = conf.high),
+    position = dodge_position_dynamics,
+    width = 0.18,
+    linewidth = 0.6
+  ) +
+  geom_point(
+    aes(fill = point_fill),
+    position = dodge_position_dynamics,
+    shape = 21,
+    size = 3.2,
+    stroke = 1.1
+  ) +
+  facet_wrap(~ specification, nrow = 1) +
+  scale_colour_manual(values = interaction_cols, name = NULL) +
+  scale_fill_manual(
+    values = c(interaction_cols, "Non-significant" = "white"),
+    guide = "none"
+  ) +
+  labs(
+    title = "Emotional volatility interactions and net votes",
+    subtitle = paste0(
+      "Filled circles indicate statistically significant interactions; ",
+      "hollow circles indicate non-significant interactions"
+    ),
+    x = NULL,
+    y = "Interaction coefficient with 95% CI",
+    caption = paste0(
+      "Coefficients show how the volatility slope changes relative to posts ",
+      "containing true-side claims only. The sentence-mean interactions are ",
+      "included in every model and are reported in the tables above."
+    )
+  ) +
+  theme_thesis(11) +
+  theme(
+    axis.text.x = element_text(angle = 20, hjust = 1),
+    legend.position = "bottom",
+    plot.caption = element_text(hjust = 0, colour = "grey35", size = 9)
+  )
+
+save_plot_both(
+  p_dynamics,
+  "D8_dynamics_volatility_interactions",
+  width = 11,
+  height = 5.2
+)
+
+p_dynamics
+```
+
+## 11.7 Sensitivity to short posts
+
+Volatility computed from a small number of sentences rests on very few adjacent differences and is therefore estimated imprecisely. Short posts also differ from long ones in other ways, so a threshold restriction serves as a check on whether the results are driven by the least reliable measurements. The author fixed effects specification is re-estimated after excluding posts with fewer than ten usable sentences.
+
+```{r}
+#| label: dynamics-short-post-sensitivity
+
+dynamics_min_sentences <- 10
+
+dynamics_short_models <- set_names(
+  map(
+    emotion_vars,
+    function(emotion) {
+      full_data <- get_dynamics_data("log_net_votes", emotion)
+      restricted <- filter(full_data, n_sentences_kept >= dynamics_min_sentences)
+      focal <- paste0(
+        "misleading_n_f * (",
+        emotion, "_volatility_z + ", emotion, "_mean_z",
+        ")"
+      )
+      list(
+        "(1) All posts" = fit_model(
+          "log_net_votes",
+          paste(focal, controls, sep = " + "),
+          full_data,
+          fe_author
+        ),
+        "(2) 10+ sentences" = fit_model(
+          "log_net_votes",
+          paste(focal, controls, sep = " + "),
+          restricted,
+          fe_author
+        )
+      )
+    }
+  ),
+  emotion_vars
+)
+
+dynamics_short_rows <- function(model_names) {
+  values <- list(
+    "Post controls" = c("Yes", "Yes"),
+    "Category fixed effects" = c("Yes", "Yes"),
+    "Month fixed effects" = c("Yes", "Yes"),
+    "Author fixed effects" = c("Yes", "Yes"),
+    "Minimum usable sentences" = c("3", as.character(dynamics_min_sentences))
+  )
+  rows <- tibble(term = names(values))
+  for (i in seq_along(model_names)) {
+    rows[[model_names[i]]] <- unname(map_chr(values, ~ .x[[i]]))
+  }
+  rows
+}
+
+dynamics_short_tables <- set_names(
+  map(
+    emotion_vars,
+    function(emotion) {
+      make_regression_table(
+        dynamics_short_models[[emotion]],
+        dynamics_coef_map(emotion),
+        paste0(
+          "Table 7E. ", emotion_labels[[emotion]],
+          " dynamics moderation excluding short posts: net votes"
+        ),
+        paste0(
+          "The dependent variable is log(1 + max(net votes, 0)). Column 2 excludes posts with fewer than ",
+          dynamics_min_sentences,
+          " usable sentences before re-estimating the author fixed effects specification."
+        ),
+        paste0("Table_7E_", emotion, "_dynamics_short_posts"),
+        spec_rows = dynamics_short_rows(names(dynamics_short_models[[emotion]]))
+      )
+    }
+  ),
+  emotion_vars
+)
+
+cat(
+  "Short-post sensitivity: posts retained",
+  nrow(filter(
+    get_dynamics_data("log_net_votes", "anger"),
+    n_sentences_kept >= dynamics_min_sentences
+  )),
+  "of",
+  nrow(get_dynamics_data("log_net_votes", "anger")), "\n"
+)
+
+dynamics_short_tables[["anger"]]
+```
+
+
+# 12. Saved model objects
+
+```{r}
+#| label: save-models
+
+all_models <- list(
+  h1_votes = h1_votes_models,
+  h1_reblogs = h1_reblog_models,
+  h1_payout = h1_payout_models,
+  h2 = h2_models,
+  title_votes = title_votes_models,
+  title_reblogs = title_reblog_models,
+  title_payout = title_payout_models,
+  eckert_votes = eckert_votes_models,
+  eckert_reblogs = eckert_reblog_models,
+  minposts_votes = minposts_votes_models,
+  minposts_reblogs = minposts_reblog_models,
+  vad = vad_models,
+  vad_sparse = vad_sparse_models
+)
+
+saveRDS(all_models, file.path(output_dir, "hive_clean_regression_models.rds"))
+
+cat("Tables, figures, and model objects saved under:\n", output_dir, "\n")
+```
+```{r}
+# 1. Log net oy ile korelasyonlar, yazar ge??mi??i dahil
+cor_check <- model_data |>
+  transmute(
+    log_net_votes, log_tags, log_images, log_links, log_len,
+    is_political, is_weekend,
+    anger, disgust, fear, joy, sadness, surprise,
+    log_pre_avg_reward, log_pre_rewards, log_pre_posts, log_acct_age
+  ) |>
+  mutate(across(everything(), as.numeric))
+
+print(round(sort(cor(cor_check, use = "pairwise.complete.obs")[, "log_net_votes"],
+                 decreasing = TRUE), 3))
+
+# 2. Ayl??k yan??lt??c?? iddia oran??
+model_data |>
+  group_by(month_f) |>
+  summarise(posts = n(),
+            share = round(100 * mean(any_misleading_claim), 1),
+            .groups = "drop") |>
+  print(n = Inf)
+
+# 3. Yo??unla??ma: alt yar?? ve ??st y??zde 10'un pay??
+conc_share <- function(outcome) {
+  totals <- model_data |>
+    group_by(author) |>
+    summarise(v = sum(pmax(.data[[outcome]], 0), na.rm = TRUE), .groups = "drop") |>
+    arrange(v)
+  n <- nrow(totals)
+  c(bottom_50 = round(100 * sum(totals$v[seq_len(floor(n / 2))]) / sum(totals$v), 2),
+    top_10    = round(100 * sum(totals$v[seq(n - floor(n / 10) + 1, n)]) / sum(totals$v), 2))
+}
+print(conc_share("net_votes")); print(conc_share("payout"))
+
+# 4. Negatif net oy ve s??f??r taban??n??n etkisi
+cat("Negatif net oy:", sum(model_data$net_votes < 0),
+    "| S??f??r veya alt??:", sum(model_data$net_votes <= 0), "\n")
+
+# 5. 3'e kar???? 0 kar????la??t??rmas??n??n Welch serbestlik derecesi
+print(t.test(model_data$log_net_votes[model_data$misleading_claim_count == 3],
+             model_data$log_net_votes[model_data$misleading_claim_count == 0]))
+```
+```{r}
+# =============================================================================
+# 4.1 tablolari: temiz, uc cizgili APA gorunumu
+# prepare-data chunk'indan sonra herhangi bir yere konabilir
+# =============================================================================
+
+fmt_stat <- function(x, digits) {
+  formatC(x, format = "f", digits = digits, big.mark = ",")
+}
+
+clean_gt <- function(tbl) {
+  tbl |>
+    tab_options(
+      table.font.size            = px(12),
+      data_row.padding           = px(3),
+      table.border.top.style     = "none",
+      table.border.bottom.style  = "none",
+      heading.border.bottom.style = "none",
+      column_labels.border.top.width    = px(1),
+      column_labels.border.top.color    = "black",
+      column_labels.border.bottom.width = px(1),
+      column_labels.border.bottom.color = "black",
+      table_body.hlines.style    = "none",
+      table_body.border.bottom.width = px(1),
+      table_body.border.bottom.color = "black",
+      row_group.border.top.style    = "none",
+      row_group.border.bottom.style = "none",
+      source_notes.font.size     = px(10)
+    ) |>
+    opt_align_table_header(align = "left")
+}
+
+# --------------------------- Table 4.1 --------------------------------------
+
+# t1_spec'in en basina bir satir ekle
+t1_spec <- tibble::tribble(
+  ~block,               ~var,                      ~label,                             ~digits,
+  "Independent variable", "misleading_claim_count", "Misleading claims (0 to 3)",       2,
+  "Outcomes",           "net_votes",                "Net votes",                        2,
+  # ... geri kalan satirlar aynen
+)
+
+t1_spec <- tibble::tribble(
+  ~block,               ~var,               ~label,                             ~digits,
+  "Outcomes",           "net_votes",        "Net votes",                        2,
+  "Outcomes",           "payout",           "Payout (HBD)",                     2,
+  "Outcomes",           "reblogs",          "Reblogs",                          2,
+  "Outcomes",           "any_reblog",       "Any reblog (0/1)",                 2,
+  "Emotional language", "anger",            "Anger",                            3,
+  "Emotional language", "disgust",          "Disgust",                          3,
+  "Emotional language", "fear",             "Fear",                             3,
+  "Emotional language", "joy",              "Joy",                              3,
+  "Emotional language", "sadness",          "Sadness",                          3,
+  "Emotional language", "surprise",         "Surprise",                         3,
+  "Controls",           "n_images",         "Images",                           2,
+  "Controls",           "n_links",          "Links",                            2,
+  "Controls",           "n_tags",           "Tags",                             2,
+  "Controls",           "log_len",          "Post length (log)",                2,
+  "Controls",           "is_political",     "Political post (0/1)",             2,
+  "Controls",           "is_weekend",       "Weekend post (0/1)",               2,
+  "Author history",     "pre_avg_reward",   "Pre-window average author reward", 1
+)
+
+table_4_1 <- purrr::map_dfr(seq_len(nrow(t1_spec)), function(i) {
+  x <- as.numeric(model_data[[t1_spec$var[i]]])
+  d <- t1_spec$digits[i]
+  tibble::tibble(
+    block       = t1_spec$block[i],
+    Variable    = t1_spec$label[i],
+    Mean        = fmt_stat(mean(x, na.rm = TRUE), d),
+    `Std. Dev.` = fmt_stat(sd(x, na.rm = TRUE), d),
+    Min         = fmt_stat(min(x, na.rm = TRUE), d),
+    Median      = fmt_stat(median(x, na.rm = TRUE), d),
+    Max         = fmt_stat(max(x, na.rm = TRUE), d)
+  )
+}) |>
+  gt(groupname_col = "block", rowname_col = "Variable") |>
+  tab_header(title = "Table 4.1. Descriptive statistics for the analysis sample") |>
+  cols_align(align = "right", columns = c(Mean, `Std. Dev.`, Min, Median, Max)) |>
+# tab_source_note metnini degistir
+  tab_source_note(md(paste(
+    "*Note.* N = 5,245 posts by 1,650 authors. Statistics are computed on the raw",
+    "scale, except post length, which is reported in logarithmic form. Net votes,",
+    "payout, and reblogging enter the models in the logarithmic or binary form",
+    "described in Section 3.6. The emotional-language scores are softmax",
+    "probabilities and are standardized within each regression."
+  ))) |>
+  clean_gt()
+
+table_4_1
+
+# --------------------------- Table 4.2 ve 4.3 -------------------------------
+
+group_means_with_tests <- function(vars, labels, digits = 3) {
+  purrr::map_dfr(seq_along(vars), function(i) {
+    d <- model_data |>
+      transmute(g = misleading_claim_count, y = as.numeric(.data[[vars[i]]])) |>
+      filter(g %in% 0:3, is.finite(y))
+    ref <- d$y[d$g == 0]
+    cell <- function(k) {
+      m <- mean(d$y[d$g == k])
+      if (k == 0) return(fmt_stat(m, digits))
+      p <- t.test(d$y[d$g == k], ref)$p.value
+      s <- if (p < .001) "***" else if (p < .01) "**" else if (p < .05) "*" else ""
+      paste0(fmt_stat(m, digits), s)
+    }
+    tibble::tibble(
+      Variable   = labels[i],
+      `0 claims` = cell(0), `1 claim` = cell(1),
+      `2 claims` = cell(2), `3 claims` = cell(3)
+    )
+  })
+}
+
+group_n <- table(factor(model_data$misleading_claim_count, levels = 0:3))
+
+build_group_table <- function(tbl, title, note) {
+  tbl |>
+    gt(rowname_col = "Variable") |>
+    tab_header(title = title) |>
+    cols_label(
+      `0 claims` = md(paste0("0 claims<br>(n = ", format(group_n[1], big.mark = ","), ")")),
+      `1 claim`  = md(paste0("1 claim<br>(n = ",  format(group_n[2], big.mark = ","), ")")),
+      `2 claims` = md(paste0("2 claims<br>(n = ", format(group_n[3], big.mark = ","), ")")),
+      `3 claims` = md(paste0("3 claims<br>(n = ", format(group_n[4], big.mark = ","), ")"))
+    ) |>
+    cols_align(align = "right", columns = -Variable) |>
+    tab_source_note(md(note)) |>
+    clean_gt()
+}
+
+star_note <- paste(
+  "Stars mark Welch two-sample tests of each group against the zero-claim group:",
+  "\\* *p* < .05, \\*\\* *p* < .01, \\*\\*\\* *p* < .001."
+)
+
+table_4_2 <- group_means_with_tests(
+  c("log_net_votes", "any_reblog", "log_payout"),
+  c("Log net votes", "Any reblog", "Log payout")
+) |>
+  build_group_table(
+    "Table 4.2. Modelled outcomes by misleading-claim count",
+    paste("*Note.* Cells are group means. Log net votes and log payout are on the",
+          "log(1 + x) scale; any reblog is a proportion.", star_note)
+  )
+
+table_4_3 <- group_means_with_tests(emotion_vars, unname(emotion_labels[emotion_vars])) |>
+  build_group_table(
+    "Table 4.3. Emotional language by misleading-claim count",
+    paste("*Note.* Cells are group means of the six classifier scores on the raw",
+          "probability scale.", star_note)
+  )
+
+table_4_2
+table_4_3
+
+if (exists("save_gt_table")) {
+  save_gt_table(table_4_1, "Table_4_1_descriptives")
+  save_gt_table(table_4_2, "Table_4_2_outcomes_by_claim_count")
+  save_gt_table(table_4_3, "Table_4_3_emotions_by_claim_count")
+}
+```
+
+```{r}
+print(round(r2_plot_data$r_squared, 3))
+print(r2_plot_data$specification)
+```
+
+```{r}
+# =============================================================================
+# Table 4.3. Birlesik H1 tablosu (iki panel, kontroller gizli)
+# =============================================================================
+
+fmt_est <- function(est, p, d = 3) {
+  s <- if (is.na(p)) ""
+       else if (p < .001) "***" else if (p < .01) "**"
+       else if (p < .05) "*"    else if (p < .1)  "+" else ""
+  paste0(formatC(est, format = "f", digits = d), s)
+}
+
+safe_r2 <- function(m, type) {
+  v <- tryCatch(unname(fixest::r2(m, type)), error = function(e) NA_real_)
+  if (length(v) == 0 || !is.finite(v)) "" else formatC(v, format = "f", digits = 3)
+}
+
+focal_map <- c("misleading_n_f1" = "1 misleading claim",
+               "misleading_n_f2" = "2 misleading claims",
+               "misleading_n_f3" = "3 misleading claims")
+
+panel_block <- function(models, panel_label) {
+  specs <- names(models)
+  rows <- list()
+  for (i in seq_along(focal_map)) {
+    tn  <- names(focal_map)[i]
+    est <- tibble(panel = panel_label, term = unname(focal_map[i]))
+    se  <- tibble(panel = panel_label, term = paste0("se_", panel_label, "_", i))
+    for (s in specs) {
+      td <- broom::tidy(models[[s]]) |> dplyr::filter(term == tn)
+      est[[s]] <- if (nrow(td)) fmt_est(td$estimate, td$p.value) else ""
+      se[[s]]  <- if (nrow(td)) paste0("(", formatC(td$std.error, format = "f", digits = 3), ")") else ""
+    }
+    rows <- c(rows, list(est, se))
+  }
+  r2  <- tibble(panel = panel_label, term = "R-squared")
+  wr2 <- tibble(panel = panel_label, term = "Within R-squared")
+  for (s in specs) {
+    r2[[s]]  <- safe_r2(models[[s]], "r2")
+    wr2[[s]] <- safe_r2(models[[s]], "wr2")
+  }
+  dplyr::bind_rows(c(rows, list(r2, wr2)))
+}
+
+spec_block <- function(models) {
+  specs <- names(models)
+  n_auth <- purrr::map_chr(specs, function(s) {
+    fe <- models[[s]]$fixef_sizes
+    n  <- if (!is.null(fe) && "author" %in% names(fe)) unname(fe[["author"]])
+          else dplyr::n_distinct(h1_votes_data$author)
+    format(n, big.mark = ",")
+  })
+  vals <- list(
+    "Post controls"         = c("No", "Yes", "Yes", "Yes"),
+    "Category and month FE" = c("No", "No",  "Yes", "Yes"),
+    "Author FE"             = c("No", "No",  "No",  "Yes"),
+    "Observations"          = purrr::map_chr(specs, ~ format(nobs(models[[.x]]), big.mark = ",")),
+    "Authors"               = n_auth
+  )
+  out <- tibble(panel = "Specification", term = names(vals))
+  for (j in seq_along(specs)) out[[specs[j]]] <- purrr::map_chr(vals, ~ .x[[j]])
+  out
+}
+
+table_4_3 <- dplyr::bind_rows(
+  panel_block(h1_votes_models,  "Panel A. Log net votes"),
+  panel_block(h1_reblog_models, "Panel B. Reblog probability"),
+  spec_block(h1_votes_models)
+) |>
+  gt(groupname_col = "panel", rowname_col = "term") |>
+  tab_header(title = "Table 4.3. Misleading claims and engagement") |>
+  cols_label(
+    `(1) Body only`           = "(1)",
+    `(2) + controls`          = "(2)",
+    `(3) + category/month FE` = "(3)",
+    `(4) + author FE`         = "(4)"
+  ) |>
+  cols_align(align = "center", columns = -term) |>
+  text_transform(
+    locations = cells_stub(),
+    fn = function(x) ifelse(grepl("^se_", x), "", x)
+  ) |>
+  tab_source_note(md(paste(
+    "*Note.* Standard errors in parentheses, heteroskedasticity-robust (HC1).",
+    "The reference category is zero misleading claims. Post controls are log post",
+    "length, political-post status, log images, log links, log tags, and weekend",
+    "posting. Their coefficients are reported in Appendix D. Panel B reports linear",
+    "probability models. \\+ *p* < .10, \\* *p* < .05, \\*\\* *p* < .01, \\*\\*\\* *p* < .001."
+  ))) |>
+  clean_gt()
+
+table_4_3
+
+if (exists("save_gt_table")) save_gt_table(table_4_3, "Table_4_3_H1_combined")
+```
+
+```{r}
+#| label: appendix-h2-compact
+
+spec_3 <- "(3) + category/month FE"
+spec_4 <- "(4) + author FE"
+
+star_string <- function(p) {
+  dplyr::case_when(
+    is.na(p)  ~ "",
+    p < 0.001 ~ "***",
+    p < 0.01  ~ "**",
+    p < 0.05  ~ "*",
+    p < 0.10  ~ "+",
+    TRUE      ~ ""
+  )
+}
+
+focal_labels <- function(emotion) {
+  z <- paste0(emotion, "_z")
+  c(
+    setNames("Emotional language (z)", z),
+    setNames("x 1 misleading claim",   paste0("misleading_n_f1:", z)),
+    setNames("x 2 misleading claims",  paste0("misleading_n_f2:", z)),
+    setNames("x 3 misleading claims",  paste0("misleading_n_f3:", z))
+  )
+}
+
+pull_focal <- function(emotion, outcome, spec, column_name) {
+  labels <- focal_labels(emotion)
+  broom::tidy(h2_models[[emotion]][[outcome]][[spec]]) |>
+    dplyr::filter(term %in% names(labels)) |>
+    dplyr::mutate(
+      row_label = unname(labels[term]),
+      cell = paste0(
+        sprintf("%.3f", estimate), star_string(p.value),
+        " (", sprintf("%.3f", std.error), ")"
+      )
+    ) |>
+    dplyr::select(row_label, cell) |>
+    dplyr::rename(!!column_name := cell)
+}
+
+h2_appendix_data <- purrr::map_dfr(emotion_vars, function(emotion) {
+  purrr::reduce(
+    list(
+      pull_focal(emotion, "log_net_votes", spec_3, "nv3"),
+      pull_focal(emotion, "log_net_votes", spec_4, "nv4"),
+      pull_focal(emotion, "any_reblog",    spec_3, "rb3"),
+      pull_focal(emotion, "any_reblog",    spec_4, "rb4")
+    ),
+    dplyr::left_join, by = "row_label"
+  ) |>
+    dplyr::mutate(emotion = unname(emotion_labels[[emotion]]), .before = 1)
+})
+
+h2_appendix_table <- h2_appendix_data |>
+  gt(groupname_col = "emotion", rowname_col = "row_label") |>
+  cols_label(nv3 = "(3)", nv4 = "(4)", rb3 = "(3)", rb4 = "(4)") |>
+  tab_spanner(label = "Log net votes",      columns = c(nv3, nv4)) |>
+  tab_spanner(label = "Reblog probability", columns = c(rb3, rb4)) |>
+  tab_header(
+    title = "Table B1. Emotional language as a moderator: focal coefficients"
+  ) |>
+  tab_source_note(source_note = md(
+    "Each emotion is estimated in a separate model. Column (3) adds category and month fixed effects and column (4) adds author fixed effects. Post controls are included in both. N = 5,245 in column (3) and 4,304 in column (4). Full estimates appear in Tables B2 to B13."
+  )) |>
+  tab_source_note(source_note = md(
+    "Notes: + p < 0.10; * p < 0.05; ** p < 0.01; *** p < 0.001. HC1 heteroskedasticity-robust standard errors in parentheses."
+  )) |>
+  tab_options(
+    table.font.size = px(11),
+    data_row.padding = px(3),
+    heading.title.font.size = px(15),
+    heading.title.font.weight = "bold",
+    column_labels.font.weight = "bold"
+  )
+
+save_gt_table(h2_appendix_table, "Table_B1_H2_focal_coefficients")
+h2_appendix_table
+```
+
+```{r}
+#| label: table-4a-collapse
+
+collapse_votes_models <- list(
+  "(1) Category and month FE"        = h1_votes_models[["(3) + category/month FE"]],
+  "(2) + pre-window author history"  = eckert_votes_models[["(1) Full model"]],
+  "(3) + author FE"                  = h1_votes_models[["(4) + author FE"]]
+)
+
+collapse_spec_rows <- function(model_names) {
+  values <- list(
+    "Post controls"             = c("Yes", "Yes", "Yes"),
+    "Pre-window author history" = c("No",  "Yes", "Absorbed"),
+    "Category fixed effects"    = c("Yes", "Yes", "Yes"),
+    "Month fixed effects"       = c("Yes", "Yes", "Yes"),
+    "Author fixed effects"      = c("No",  "No",  "Yes")
+  )
+  rows <- tibble(term = names(values))
+  for (i in seq_along(model_names)) {
+    rows[[model_names[i]]] <- unname(map_chr(values, ~ .x[[i]]))
+  }
+  rows
+}
+
+make_regression_table(
+  collapse_votes_models,
+  eckert_coef_map,
+  "Table 4A. Misleading claims, author history, and net votes",
+  paste(
+    "The dependent variable is log(1 + max(net votes, 0)).",
+    "Column 1 repeats the specification reported in Table 1A.",
+    "Column 2 adds four measures of author standing constructed from activity recorded before the observation window.",
+    "Column 3 replaces those measures with author fixed effects."
+  ),
+  "Table_4A_author_history_collapse",
+  spec_rows = collapse_spec_rows(names(collapse_votes_models))
+)
+```
+
